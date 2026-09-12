@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "dwm.alttab",
+  "name": "Alt-Tab Window Preview",
+  "version": "1.1.0",
+  "author": "d4vid87",
+  "license": "MIT",
+  "description": "Windows 11-style Alt-Tab switcher with live window previews, MRU ordering and release-to-switch.",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "AltTab.qml"
+  }
+}

@@ -1,0 +1,99 @@
+[bar]
+size-horizontal = 34
+icon-slot = 32
+background = "#000000"
+background-alpha = 1.0
+text = "#39ff14"
+active = "#39ff14"
+
+[controls]
+normal-color = "#39ff14"
+normal-border = "#39ff14"
+hover-cursor-color = "#39ff14"
+hover-cursor-border = "#39ff14"
+focus-color = "#39ff14"
+focus-border = "#39ff14"
+selected-color = "#39ff14"
+selected-border = "#39ff14"
+
+[popups]
+background = "#000000"
+background-alpha = 1.0
+text = "#39ff14"
+border = "#39ff14"
+border-alpha = 1.0
+
+[tooltip]
+background = "#000000"
+background-alpha = 1.0
+text = "#39ff14"
+border = "#39ff14"
+border-alpha = 1.0
+
+[notifications]
+background = "#000000"
+background-alpha = 1.0
+text = "#39ff14"
+border = "#39ff14"
+border-alpha = 1.0
+countdown = "#39ff14"
+
+[launcher]
+background = "#000000"
+background-alpha = 1.0
+text = "#39ff14"
+border = "#39ff14"
+border-alpha = 1.0
+scrim = "#000000"
+scrim-alpha = 0.6
+selected-background = "#39ff14"
+selected-background-alpha = 0.20
+selected-text = "#39ff14"
+selected-border = "#39ff14"
+selected-border-alpha = 1.0
+
+[menu]
+background = "#000000"
+background-alpha = 1.0
+text = "#39ff14"
+border = "#39ff14"
+border-alpha = 1.0
+scrim = "#000000"
+scrim-alpha = 0.6
+selected-background = "#39ff14"
+selected-background-alpha = 0.20
+selected-text = "#39ff14"
+selected-border = "#39ff14"
+selected-border-alpha = 1.0
+
+[polkit]
+background = "#000000"
+background-alpha = 1.0
+text = "#39ff14"
+border = "#39ff14"
+border-alpha = 1.0
+scrim = "#000000"
+scrim-alpha = 0.6
+accent = "#39ff14"
+
+[lock]
+background = "#000000"
+background-alpha = 1.0
+text = "#39ff14"
+border = "#39ff14"
+border-alpha = 1.0
+scrim = "#000000"
+scrim-alpha = 0.6
+placeholder = "#1a7a0c"
+border-active = "#39ff14"
+selection = "#39ff14"
+selection-alpha = 0.45
+
+[image-picker]
+scrim = "#000000"
+scrim-alpha = 0.6
+text = "#39ff14"
+selected-border = "#39ff14"
+selected-border-alpha = 1.0
+unselected-border = "#39ff14"
+unselected-border-alpha = 0.28
