@@ -1,6 +1,7 @@
 aether
 alsa-utils
 amd-ucode
+android-tools
 asdcontrol
 base
 base-devel
@@ -41,7 +42,9 @@ fd
 ffmpegthumbnailer
 firefox
 foot
+fwupd
 fzf
+ghostty
 git
 gnome-disk-utility
 gnome-keyring
@@ -80,6 +83,8 @@ limine
 linux
 linux-firmware
 linux-headers
+linux-omarchy
+linux-omarchy-headers
 llvm
 localsend
 lua51

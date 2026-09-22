@@ -36,6 +36,12 @@
           "id": "omarchy.tray"
         },
         {
+          "id": "com.omastorm.radar"
+        },
+        {
+          "id": "omaplug"
+        },
+        {
           "id": "akitaonrails.ai-usagebar",
           "lastSelectedEntryId": "openai"
         },
@@ -83,9 +89,15 @@
     },
     {
       "id": "io.github.sirjul1337.lock-explorer",
-      "design": "neon",
+      "avatar": "/run/media/dwm/cd2a0b2a-3738-4e5e-aa88-595c558ac03c/20240806_215558.jpg",
       "boot": "theme",
-      "avatar": "/run/media/dwm/cd2a0b2a-3738-4e5e-aa88-595c558ac03c/20240806_215558.jpg"
+      "design": "storm"
+    },
+    {
+      "id": "io.github.deunnis.lacquer"
+    },
+    {
+      "id": "bobbynicholas.omaland"
     }
   ],
   "version": 1

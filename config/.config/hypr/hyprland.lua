@@ -34,11 +34,10 @@ hl.env("HYPRCURSOR_THEME", "Bibata-Modern-Ice-Right")
 hl.env("XCURSOR_SIZE", "40")
 hl.env("HYPRCURSOR_SIZE", "40")
 
--- Neon green border on the active window. Set after the toggles require above,
+-- Keep the theme-colored border visible. Set after the toggles require above,
 -- because window-no-gaps forces border_size = 0.
 hl.config({
   general = {
     border_size = 3,
-    ["col.active_border"] = "rgb(39FF14)",
   },
 })

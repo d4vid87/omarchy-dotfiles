@@ -26,3 +26,17 @@ fallback remains first, so other displays still work; edit
 `~/.config/hypr/monitors.lua` for the new hardware.
 
 Run `./update.sh` on the original computer to refresh this backup before pushing.
+
+## Snapshot: 2026-09-22
+
+Includes current Hyprland, terminal and shell settings, custom plugins, six
+third-party plugin revisions, Noir and Deep Space themes, active generated theme
+and wallpaper selections, and installed package lists. The installer restores
+`state/current` as well as configuration. Accounts, credentials, clipboard history,
+notifications, and other application data are excluded.
+
+External dependencies are not bundled: the lock-screen avatar on `/run/media`,
+`~/AppImages/stormdesk.appimage`, `~/AppImages/hookecho.appimage`, and system-installed
+fonts/icons. Restore those separately. This is a desktop configuration export,
+not a full operating-system backup. Plugin-specific state outside the current
+theme directory is not included.

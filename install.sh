@@ -8,6 +8,14 @@ mkdir -p "$backup"
 for name in hypr omarchy alacritty ghostty kitty starship.toml; do
   [[ -e "$HOME/.config/$name" ]] && cp -a -- "$HOME/.config/$name" "$backup/"
 done
+[[ -d "$HOME/.local/state/omarchy/current" ]] && cp -a "$HOME/.local/state/omarchy/current" "$backup/current"
+mkdir -p "$HOME/.local/state/omarchy/current"
+rsync -a "$repo/state/current/" "$HOME/.local/state/omarchy/current/"
+for link in "$HOME/.local/state/omarchy/current/"background*; do
+  [[ -L "$link" ]] || continue
+  target=$(readlink "$link")
+  ln -sfn "${target/#\/home\/dwm/$HOME}" "$link"
+done
 rsync -a "$repo/config/.config/" "$HOME/.config/"
 
 rg -l -0 '/home/dwm' "$HOME/.config/hypr" "$HOME/.config/omarchy" 2>/dev/null |
