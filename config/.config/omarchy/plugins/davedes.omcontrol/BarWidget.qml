@@ -1,0 +1,543 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+import "Model.js" as Model
+
+BarWidget {
+  id: root
+  moduleName: "davedes.omcontrol"
+
+  property var lastData: null
+  property bool privacyAlert: false
+  property string lastError: ""
+  property var privacyDevices: []
+  property var privacyEvents: []
+  property var barStats: ["cpu", "cputemp"]
+  property string barStatMode: "name"
+  property bool barShowBell: true
+  property int unreadCount: 0
+  property string bellColorToken: "dim"
+
+  // Matches the "ok" semantic green used by AppWindow's trust chips / event
+  // roles: #3FB950 blended 22% toward the live accent so the bar bell and the
+  // window agree and both track the theme. Mirrors AppWindow's tinted().
+  function tintedOk() {
+    var base = Qt.rgba(0x3f / 255, 0xb9 / 255, 0x50 / 255, 1)
+    var accent = Color.accent
+    var t = 0.22
+    return Qt.rgba(base.r + (accent.r - base.r) * t,
+                   base.g + (accent.g - base.g) * t,
+                   base.b + (accent.b - base.b) * t, 1)
+  }
+  readonly property color bellColor: {
+    switch (root.bellColorToken) {
+      case "danger": return root.bar && root.bar.urgent ? root.bar.urgent : Color.urgent
+      case "green": return root.tintedOk()
+      case "accent": return Color.accent
+      default: return root.bar && root.bar.foreground ? root.bar.foreground : Color.foreground
+    }
+  }
+
+  readonly property bool bellActive: root.barShowBell && root.unreadCount > 0
+
+  readonly property bool ready: lastData !== null
+  readonly property real cpuPct: ready ? lastData.cpu_pct : 0
+  readonly property int cpuTemp: ready ? lastData.cpu_temp : 0
+  readonly property int gpuTemp: ready ? lastData.gpu_temp : 0
+  readonly property bool alert: ready ? Model.hasAlert(lastData) || privacyAlert : false
+
+  // ---- stale-data indicator: lastData.ts is stamped by collect.sh; when the
+  // data stops arriving (>15s with no fresh sample) the label switches to a
+  // warning glyph and the poll fan throttles down until fresh data returns.
+  // Date.now() is NOT a QML dependency, so a binding on it would freeze once
+  // lastData stops changing and stale could never fire. clockSec is a real
+  // reactive dependency, advanced every second by the clock timer below.
+  property int clockSec: Math.floor(Date.now() / 1000)
+  readonly property int sampleAge: ready ? Math.max(0, root.clockSec - Number(root.lastData.ts || 0)) : -1
+  readonly property bool stale: ready && sampleAge > 15
+  property int pollMs: 2000
+  function recomputePoll() {
+    var target = root.stale ? 6000
+              : (root.lastData && root.lastData.cpu_pct !== undefined && root.lastData.cpu_pct < 15) ? 5000
+              : 2000
+    if (target !== root.pollMs) root.pollMs = target
+  }
+
+  // Toasts for new apps / privacy access are the single choke point in
+  // backend/sql-ins.py (gated by alert_prefs.json modes). The bar only flags.
+  readonly property string alertUrgency: root.setting("alertUrgency", "normal")
+
+  readonly property string label: {
+    if (!ready) return "󰍛 ..."
+    var icon = (alert || stale) ? "\uf071 " : "󰍛 "
+    var parts = []
+    var list = root.barStats || []
+    for (var i = 0; i < list.length; i++) {
+      var v = Model.barStatValue(lastData, list[i])
+      if (!v) continue
+      var lead = root.barStatMode === "none" ? "" : Model.barStatLabel(list[i])
+      parts.push(lead ? lead + " " + v : v)
+    }
+    var prefix = (root.barShowBell && root.unreadCount > 0) ? "󰂞 " + root.unreadCount + " " : ""
+    if (parts.length === 0) return (prefix + icon).trim()
+    return prefix + icon + parts.join("  ")
+  }
+
+  function refresh() {
+    collectProc.running = true
+  }
+
+  function open() {
+    if (appLoader.item) appLoader.item.open = true
+  }
+
+  function close() {
+    if (appLoader.item) appLoader.item.open = false
+  }
+
+  function toggle() {
+    if (appLoader.item) appLoader.item.open = !appLoader.item.open
+  }
+
+  function appTab(tab) {
+    if (appLoader.item) {
+      appLoader.item.open = true
+      appLoader.item.activeTab = tab
+    }
+  }
+
+  function openTab(tab) {
+    root.appTab(tab)
+  }
+
+  function openApp() {
+    if (appLoader.item) appLoader.item.open = true
+  }
+
+  readonly property bool opened: appLoader.item ? appLoader.item.open === true : false
+
+  readonly property real openPanelIndicatorWidth: button.labelWidth
+  readonly property real openPanelIndicatorHeight: Math.max(Style.space(10), Math.round(Style.bar.iconSlot * 0.55))
+
+  function enforceRules() {
+    if (!enforceProc.running) enforceProc.running = true
+  }
+
+  function onEnforce(text) {
+    root.refresh()
+    var killed = 0
+    try {
+      var d = JSON.parse(text)
+      killed = (d.killed || []).length
+    } catch (e) {}
+    root.notify("OmaControl", "Enforced rules — " + killed + " process(es) matched", "normal")
+  }
+
+  // ---- Desktop notifications
+
+  function notify(headline, body, urgency) {
+    if (!root.bar || !root.bar.run) return
+    var u = Util.shellQuote(urgency || root.alertUrgency)
+    var appName = Util.shellQuote("OmaControl")
+    var headlineQ = Util.shellQuote(headline)
+    var bodyQ = body ? " " + Util.shellQuote(body) : ""
+    root.bar.run("omarchy-notification-send --app-name " + appName + " -u " + u + " " + headlineQ + bodyQ)
+  }
+
+  Loader {
+    id: appLoader
+    active: true
+    source: Qt.resolvedUrl("AppWindow.qml")
+    visible: false
+    onStatusChanged: {
+      if (status === Loader.Error) console.log("OMC APP LOAD ERROR: " + (typeof errorString === "function" ? errorString() : "?"))
+    }
+  }
+
+  Component.onCompleted: {
+    barStatsLoadProc.running = true
+    refresh()
+    privacyProc.running = true
+    unreadProc.running = true
+  }
+
+  IpcHandler {
+    target: "davedes.omcontrol"
+
+    function refresh(): void {
+      root.broadcast("refresh")
+    }
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function openTab(tab: int): void { root.openTab(tab !== null ? Number(tab) : 0) }
+    function setBarStats(stats: string): void {
+      if (stats !== null) root.setBarStats(String(stats).split(",").map(function(s) { return s.trim() }).filter(function(s) { return s }))
+    }
+    function setBarStatMode(mode: string): void {
+      if (mode !== null) root.setBarStatMode(String(mode))
+    }
+    function enforce(): void { root.enforceRules() }
+    function state(): string {
+      return JSON.stringify({
+        ready: root.ready,
+        opened: root.opened,
+        alert: root.alert,
+        appWindow: appLoader.item ? appLoader.item.open === true : false,
+        activeTab: appLoader.item ? appLoader.item.activeTab : 0,
+        barStats: root.barStats || [],
+        barStatMode: root.barStatMode || "name"
+      })
+    }
+    function openApp(): void {
+      if (appLoader.item) appLoader.item.open = true
+    }
+    // Open the details panel for a named app. Lets the panel be opened
+    // from a keybinding or script without clicking a row.
+    function showDetails(name: string): bool {
+      if (!appLoader.item || !name) return false
+      return appLoader.item.showDetails(String(name))
+    }
+    // Open a process binary (from the open details panel) with the desktop
+    // default handler.
+    function openProcPath(pid: int): bool {
+      if (!appLoader.item || pid === null) return false
+      return appLoader.item.openProcPath(Number(pid))
+    }
+    function closeApp(): void {
+      if (appLoader.item) appLoader.item.open = false
+    }
+    function toggleApp(): void {
+      if (appLoader.item) appLoader.item.open = !appLoader.item.open
+    }
+    function setAppTab(tab: int): void {
+      if (appLoader.item) appLoader.item.activeTab = Number(tab)
+    }
+    function toggleProcRows(): bool {
+      return appLoader.item ? appLoader.item.toggleProcRows() : false
+    }
+    function procRowsInfo(): string {
+      return appLoader.item ? appLoader.item.procRowsInfo() : "{}"
+    }
+  }
+
+  // ---- Hardened spawner -----------------------------------------------------
+  // Every external helper is launched through a GNU coreutils timeout (own
+  // process group → group-level SIGTERM then SIGKILL after a 2s grace, giving
+  // hard deadlines + reaping), the stdio-cap wrapper, a fixed absolute
+  // interpreter, and an explicit minimal environment. Nothing inherited from
+  // the shell's environment (user PATH, LD_*, locale) can influence the
+  // collector or let a shadow executable be resolved.
+  readonly property string dataDir: Quickshell.env("HOME") + "/.local/share/omcontrol"
+  readonly property string barStatsPath: dataDir + "/barstats.json"
+  readonly property string runnerPath: Qt.resolvedUrl("backend/run-capped.sh").toString().replace("file://", "")
+  readonly property string prefsPath: Qt.resolvedUrl("backend/prefs.py").toString().replace("file://", "")
+  readonly property int maxOutputBytes: 1048576
+  readonly property var trustedEnv: ({
+    "PATH": "/usr/bin:/bin",
+    "HOME": Quickshell.env("HOME"),
+    "OMCONTROL_DATA_DIR": dataDir,
+    "LC_ALL": "C"
+  })
+  function capText(text) {
+    return typeof text === "string" && text.length > root.maxOutputBytes
+      ? text.slice(0, root.maxOutputBytes) : (text || "")
+  }
+
+  Process {
+    id: collectProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    command: ["/usr/bin/timeout", "-k", "2", "10", "/bin/sh", root.runnerPath, "/bin/sh",
+              Qt.resolvedUrl("backend/collect.sh").toString().replace("file://", "")]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var data = Model.parseCollect(root.capText(text))
+        if (data) {
+          root.lastData = data
+          root.lastError = ""
+          root.setPrivacyAlert()
+        } else {
+          root.lastError = "parse error"
+        }
+      }
+    }
+  }
+
+  Process {
+    id: enforceProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    command: ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+              Qt.resolvedUrl("backend/enforce.sh").toString().replace("file://", "")]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onEnforce(root.capText(text))
+    }
+  }
+
+  Process {
+    id: privacyProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    command: ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+              Qt.resolvedUrl("backend/privacy.sh").toString().replace("file://", "")]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onPrivacy(root.capText(text))
+    }
+  }
+
+  Process {
+    id: barStatsLoadProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    command: ["/usr/bin/timeout", "-k", "2", "5", "/bin/sh", root.runnerPath, "/usr/bin/python3",
+              root.prefsPath, "read"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(root.capText(text))
+          if (parsed && parsed.barShowBell !== undefined) root.barShowBell = parsed.barShowBell === true
+          if (Array.isArray(parsed)) {
+            root.barStats = parsed
+          } else if (parsed && parsed.stats) {
+            root.barStats = parsed.stats
+            if (parsed.mode === "name" || parsed.mode === "none") root.barStatMode = parsed.mode
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  function saveBarPrefs() {
+    var payload = JSON.stringify({ stats: root.barStats, mode: root.barStatMode, barShowBell: root.barShowBell })
+    barStatsSaveProc.command = ["/usr/bin/timeout", "-k", "2", "5", "/bin/sh", root.runnerPath, "/usr/bin/python3",
+                                root.prefsPath, "write"]
+    barStatsSaveProc.pending = payload
+    barStatsSaveProc.running = false
+    barStatsSaveProc.running = true
+  }
+
+  function setBarStats(list) {
+    if (!Array.isArray(list)) return
+    root.barStats = list
+    root.saveBarPrefs()
+  }
+
+  function setBarStatMode(mode) {
+    if (mode !== "name" && mode !== "none") return
+    root.barStatMode = mode
+    root.saveBarPrefs()
+  }
+
+  Process {
+    id: barStatsSaveProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdinEnabled: true
+    property string pending: ""
+    onStarted: {
+      if (barStatsSaveProc.pending !== "") barStatsSaveProc.write(barStatsSaveProc.pending)
+      barStatsSaveProc.stdinEnabled = false
+    }
+    onExited: function(exitCode, exitStatus) {
+      if (barStatsSaveProc.stdinEnabled === false) barStatsSaveProc.stdinEnabled = true
+      barStatsSaveProc.pending = ""
+    }
+  }
+
+  function setPrivacyAlert() {
+    root.privacyAlert = root.privacyDevices && root.privacyDevices.length > 0
+  }
+
+  function onPrivacy(text) {
+    var parsed = Model.parsePrivacy(text)
+    root.setPrivacyAlertFrom(parsed.devices)
+    root.privacyEvents = parsed.events
+  }
+
+  function setPrivacyAlertFrom(devices) {
+    root.privacyAlert = devices && devices.length > 0
+    root.privacyDevices = devices || []
+  }
+
+  Process {
+    id: unreadProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    command: ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+              Qt.resolvedUrl("backend/unread.sh").toString().replace("file://", "")]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var d = JSON.parse(root.capText(text))
+          root.unreadCount = d && d.count ? Number(d.count) : 0
+          root.bellColorToken = d && d.color ? String(d.color) : "dim"
+        } catch (e) {
+          root.unreadCount = 0
+          root.bellColorToken = "dim"
+        }
+      }
+    }
+  }
+
+  Timer {
+    id: clockTimer
+    interval: 1000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.clockSec = Math.floor(Date.now() / 1000)
+  }
+
+  Timer {
+    interval: root.pollMs
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: {
+      root.recomputePoll()
+      if (!collectProc.running) root.refresh()
+      if (!privacyProc.running) privacyProc.running = true
+      if (!barStatsLoadProc.running) barStatsLoadProc.running = true
+      if (root.barShowBell && !unreadProc.running) unreadProc.running = true
+    }
+  }
+
+  visible: ready
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  WidgetButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: root.label
+    fontSize: Style.font.caption
+    active: root.alert || root.bellActive || root.stale
+    activeColor: (root.alert || root.stale) ? (root.bar && root.bar.urgent ? root.bar.urgent : Color.urgent) : root.bellColor
+    tooltipText: {
+      if (!root.ready) return "OmaControl — loading..."
+      var d = root.lastData || {}
+      var tip = "OmaControl\n"
+      tip += "CPU: " + Model.fmtPct(d.cpu_pct) + "  " + Model.fmtTemp(d.cpu_temp) + "\n"
+      tip += "RAM: " + Model.fmtMem(d.mem_used_mb) + " / " + Model.fmtMem(d.mem_total_mb) + "\n"
+      tip += "GPU: " + Model.fmtPct(d.gpu_pct) + "  " + Model.fmtTemp(d.gpu_temp) + "\n"
+      tip += "Processes: " + d.proc_count
+      if (root.stale) tip += "\n⚠ No fresh data (" + root.sampleAge + "s ago)"
+      if (root.privacyAlert) tip += "\n⚠ Privacy alert active"
+      if (root.alert) tip += "\n⚠ " + Model.alertReason(d)
+      tip += "\n\nLeft: window • Middle: refresh • Right: menu"
+      return tip
+    }
+    onPressed: function(b) {
+      if (b === Qt.LeftButton) root.toggle()
+      else if (b === Qt.MiddleButton) root.refresh()
+      else if (b === Qt.RightButton) contextMenu.open = true
+    }
+  }
+
+  // ---- Right-click context menu
+
+  PopupCard {
+    id: contextMenu
+    anchorItem: button
+    bar: root.bar
+    triggerMode: "click"
+    contentWidth: Style.space(210)
+
+    function dismiss() { contextMenu.open = false }
+
+    // contentHeight sizes the whole popup window; the card's padding + border
+    // (verticalContentInset) is drawn on top, so it must be added back or the
+    // last row gets clipped.
+    contentHeight: menuCol.implicitHeight + contextMenu.verticalContentInset + Style.space(4)
+
+    Column {
+      id: menuCol
+      width: parent.width
+      spacing: Style.space(2)
+
+      component MenuItem: Item {
+        id: item
+        property string glyph: ""
+        property string label: ""
+        property var action: null
+
+        width: parent ? parent.width : 0
+        height: Style.space(28)
+
+        Rectangle {
+          anchors.fill: parent
+          radius: 12
+          color: itemHover.containsMouse ? Qt.darker(root.bar.foreground, 1.3) : "transparent"
+          opacity: itemHover.containsMouse ? 0.3 : 0
+        }
+
+        Row {
+          anchors.fill: parent
+          anchors.margins: Style.space(2)
+          spacing: Style.space(8)
+
+          Text {
+            text: item.glyph
+            color: root.bar.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            width: Style.space(16)
+            anchors.verticalCenter: parent.verticalCenter
+          }
+          Text {
+            text: item.label
+            color: root.bar.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+
+        MouseArea {
+          id: itemHover
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: {
+            contextMenu.dismiss()
+            if (item.action) item.action()
+          }
+        }
+      }
+
+      Text {
+        text: "OmaControl"
+        color: Qt.darker(root.bar.foreground, 1.4)
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.caption
+        font.bold: true
+        font.letterSpacing: 1
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(6)
+        topPadding: Style.space(2)
+      }
+
+      MenuItem { glyph: "󰋗"; label: "Activity"; action: function() { root.appTab(0) } }
+      MenuItem { glyph: "󰦨"; label: "Apps"; action: function() { root.appTab(1) } }
+      MenuItem { glyph: "󰍬"; label: "Alerts"; action: function() { root.appTab(2) } }
+      MenuItem { glyph: "󰃶"; label: "Events"; action: function() { root.appTab(3) } }
+      MenuItem { glyph: "󰚠"; label: "Settings"; action: function() { root.appTab(4) } }
+
+      Item { width: parent.width; height: Style.space(4) }
+
+      MenuItem { glyph: "󰑓"; label: "Refresh"; action: function() { root.refresh() } }
+    }
+  }
+}

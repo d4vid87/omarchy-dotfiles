@@ -1,0 +1,6451 @@
+import QtQuick
+import QtQuick.Layouts
+import Quickshell
+import Quickshell.Io
+import Quickshell.Wayland
+import qs.Commons
+import qs.Ui
+import "Model.js" as Model
+
+// OmaControl standalone app window (theme-aware). Shown via IPC openApp/closeApp.
+//
+// Tabs: Activity (live metric pills, zoomable history graph with hover tooltip +
+// click-to-drill, mini range selector, process list with search + sparklines),
+// Apps (grouped by name with quick-action menus: terminate/suspend/resume/renice),
+// Alerts (threshold + runaway-process buckets with dismiss), Events (new-app and
+// spike feed with unread dots). Plus a compact/expand mode.
+//
+// Text safety: every Text item bound to a string that did not originate in this
+// file — /proc cmdlines, binary and cwd paths, usernames, systemd unit names,
+// .desktop names and descriptions, alert and event text — sets
+// `textFormat: Text.PlainText`. Qt's default is AutoText, so an untrusted
+// argument containing an <img src="https://…"> tag becomes a network request
+// that hands the viewer's IP address and viewing time to whoever wrote that
+// argument; another local user controls their own process command lines. No
+// label here needs rich text, so PlainText costs nothing visually. Keep new
+// untrusted bindings on PlainText.
+
+PanelWindow {
+  id: root
+  property bool open: false
+  property bool compact: false
+  property string layerNamespace: "omarchy-omacontrol-app"
+
+  visible: open
+  anchors { top: true; bottom: true; left: true; right: true }
+  color: "transparent"
+  exclusionMode: ExclusionMode.Ignore
+  WlrLayershell.namespace: root.layerNamespace
+  WlrLayershell.layer: WlrLayer.Overlay
+  WlrLayershell.keyboardFocus: root.open ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+
+  // ---- Theme (follows the running Omarchy theme automatically) ----
+  readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color fg: Color.foreground
+  readonly property color bg: Color.background
+  readonly property color accent: Color.accent
+  readonly property color urgent: Color.urgent
+  readonly property color muted: Color.muted
+  readonly property color surface: Color.popups.background
+  readonly property color surfaceBorder: Color.popups.border
+  readonly property color dim1: Qt.darker(fg, 1.35)
+  readonly property color dim2: Qt.darker(fg, 1.7)
+  readonly property color accentSoft: Qt.rgba(accent.r, accent.g, accent.b, 0.14)
+
+  // ---- Semantic palette -------------------------------------------------
+  // Trust / severity / event-kind colors used to be hardcoded hexes (green
+  // #3fbf6f, amber #e0a030, Tailwind event hues). They read as pasted-in on
+  // some themes. Each role is a fixed hue nudged a fraction toward the live
+  // accent so the family feels native to the palette while the per-kind
+  // distinctions (verified vs unsigned, launch vs spike vs mic) survive.
+  // `soft` fills are the low-alpha chip/tint backgrounds.
+  function mixColor(a, b, t) {
+    t = Math.max(0, Math.min(1, t))
+    return Qt.rgba(a.r + (b.r - a.r) * t,
+                   a.g + (b.g - a.g) * t,
+                   a.b + (b.b - a.b) * t,
+                   a.a + (b.a - a.a) * t)
+  }
+  // Base role colours are explicit sRGB values (not Qt.hsla) so the result is
+  // predictable across Qt builds: ok #3FB950, warn #D29922, info #58A6FF,
+  // action #BC8CFF. Each is blended 22% toward the live accent so the family
+  // sits in the theme while the per-kind distinctions survive.
+  function tinted(hex) {
+    var r = parseInt(hex.substr(1, 2), 16) / 255
+    var g = parseInt(hex.substr(3, 2), 16) / 255
+    var b = parseInt(hex.substr(5, 2), 16) / 255
+    return root.mixColor(Qt.rgba(r, g, b, 1), root.accent, 0.22)
+  }
+  function softColor(c, a) { return Qt.rgba(c.r, c.g, c.b, a === undefined ? 0.16 : a) }
+
+  // Monogram avatar colour (AppControl's circular app icons). No icon pipeline
+  // exists in app_meta, so we derive a stable colour per app name from a small
+  // set of fixed hues, blended toward the live accent by the same 22% tint rule
+  // used for the semantic palette — so avatars always look native to the theme
+  // and never appear as pasted-in literals.
+  readonly property var avatarHues: ["#3FB950", "#58A6FF", "#D29922", "#BC8CFF", "#E06C9F", "#2AA198", "#8B7FE8", "#C97B3C"]
+  function avatarColor(name) {
+    var s = String(name || "?")
+    var h = 0
+    for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0
+    return root.tinted(root.avatarHues[h % root.avatarHues.length])
+  }
+
+  readonly property color ok: root.tinted("#3FB950")
+  readonly property color warn: root.tinted("#D29922")
+  readonly property color info: root.tinted("#58A6FF")
+  readonly property color action: root.tinted("#BC8CFF")
+  readonly property color danger: root.urgent
+  readonly property color neutral: root.muted
+
+  readonly property color okSoft: root.softColor(ok)
+  readonly property color warnSoft: root.softColor(warn)
+  readonly property color infoSoft: root.softColor(info)
+  readonly property color dangerSoft: root.softColor(urgent)
+
+  // Readable text color for a filled surface (perceived-luminance test), so
+  // a light accent on a light theme still gets dark-on-fill text instead of
+  // the white-on-white that a fixed "#FFFFFF" produced.
+  readonly property color onAccent: root.onColor(accent)
+  function onColor(bg) {
+    var lum = 0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b
+    return lum > 0.6 ? Qt.rgba(0.06, 0.06, 0.07, 1) : Qt.rgba(1, 1, 1, 1)
+  }
+
+  // Leading geometry of the app/process row text block. Declared once here so the
+  // rows and the ColHeader labels can never drift apart when the avatar changes.
+  // The name block's *trailing* edge is not a constant: it is anchored to the
+  // trust-chip slot, so it always meets the chips at a fixed gap (see below).
+  readonly property real rowAvatarSize: Style.space(26)
+  // 8 (left pad) + 26 (avatar) + 6 (gap) + 8 (run dot) + 8 (gap)
+  readonly property real rowLead: Style.space(8) + rowAvatarSize + Style.space(6) + Style.space(8) + Style.space(8)
+
+  // ---- Activity column vertical budget
+  // The Activity page stacks a metric tab row, the history chart, the
+  // temperature strip, the mini overview and the process list. The list is a
+  // FIXED height showing `procRowsVisible` rows and scrolls for the rest; the
+  // chart is the flexible element that absorbs whatever vertical space is left
+  // over. That keeps the list from collapsing to one row on short screens and
+  // stops the chart from starving it on tall ones.
+  readonly property int procRowsVisible: 4
+  readonly property real procRowH: Style.space(34)
+  readonly property real procRowSpacing: Style.space(2)
+  readonly property real procListH: procRowsVisible * (procRowH + procRowSpacing) - procRowSpacing
+  // The chrome stacked above the list inside the pane: search/sort row, the
+  // "Running processes ..." line, and the column header.
+  readonly property real paneHeadH: Style.space(30) + Style.space(4) + Style.space(14) + Style.space(6) + Style.space(18) + Style.space(2)
+  readonly property real paneH: paneHeadH + procListH
+
+  // Border specs for the app's card + tooltip surfaces, resolved once from the
+  // theme's [popups] / [tooltip] roles so they honor per-theme border styling.
+  readonly property var cardBorderSpec: Border.localOrSurfaceSpec("popups", "border", surfaceBorder, Color.popups.border, Math.max(1, Style.space(2)))
+  readonly property var tipBorderSpec: Border.localOrSurfaceSpec("tooltip", "border", Color.tooltip.border, Color.tooltip.border, Style.normalBorderWidth)
+
+  // ---- Data (DB snapshot via sample-json.sh) ----
+  property var sample: ({ cpu: 0, mem: 0, gpu: 0, procs: 0, disk: 0, disk_r: 0, disk_w: 0,
+                          net_rx_kbs: 0, net_tx_kbs: 0,
+                          history_1h: [], history_6h: [], history_1d: [],
+                          p_list: [], snaps: [], apps: [], catalog: [],
+                          alerts: [], events: [], alert_prefs: {},
+                          alert_profile: "medium", alert_thresholds: {},
+                          disabled: [], perms: {} })
+  property string selMetric: "cpu"
+  property int chartWindow: 3600
+
+  // Omarchy-style rotating tagline under the title; a new quip every 5s.
+  readonly property var subtitles: [
+    "Your machine, live",
+    "Keeping an eye on your CPU since forever",
+    "Every process has a story — here it is",
+    "Spikes, apps, and the occasional villain",
+    "Sampled every 2 seconds. Yes, really.",
+    "Your RAM called. It wants peace.",
+    "Somebody downloaded something…",
+    "The GPU snores. The charts do not.",
+    "Events: where apps get caught red-handed",
+    "Kill, disable, repeat.",
+    "The charts never lie. Mostly.",
+    "Logged on since PID 1"
+  ]
+  property int subtitleIdx: 0
+  readonly property string subtitleText: root.subtitles[root.subtitleIdx % root.subtitles.length]
+  Timer {
+    interval: 5000
+    running: true
+    repeat: true
+    onTriggered: root.subtitleIdx++
+  }
+
+  // Net and Disk series are KB/s (bytes), matching the pill/popup/tooltip.
+  readonly property var chartPtsRaw: root.seriesFor(root.selMetric, root.chartWindow)
+  readonly property real chartScale: 1
+  readonly property string chartUnit: root.metricUnits[root.selMetric] || ""
+  readonly property var chartPts: root.chartPtsRaw
+
+  property int activeTab: 0
+  property string search: ""
+  property var drillProcs: null
+  property real drillTs: 0
+  property var rangeSummary: null
+  property var filteredProcs: []
+  property bool sampleProcRunning: false
+  property var filteredApps: []
+  property string appSearch: ""
+  property string activityFilter: "all"
+  property string procSort: "cpu"
+  property string appSort: "cpu"
+  property bool showDisabledOnly: false
+  property var dismissedAlerts: []
+  property string alertFilter: "all"
+  property string eventFilter: "all"
+  property string eventSearch: ""
+  property var filteredEvents: []
+  property int alertsSeenTs: 0
+  property int eventSeenTs: 0
+  property int alertBadge: 0
+  property int eventBadge: 0
+  property var alertPrefs: ({ enabled: true, types: {}, charts: {} })
+  property string alertProfile: "medium"
+  property var alertThresholds: ({})
+  property var detailApp: null
+  property var eventDetail: null
+  property var detailStats: null
+  property bool detailStatsBusy: false
+  property var detailNet: null
+  property bool detailNetBusy: false
+  property var procDetail: []
+  property bool procDetailBusy: false
+  property var eventCtx: null
+  property bool eventCtxBusy: false
+
+  property var barPrefs: ({ stats: ["cpu", "cputemp"], mode: "name" })
+  property bool barPrefsLoaded: false
+  property bool perProcNet: true
+  readonly property string dataDir: Quickshell.env("HOME") + "/.local/share/omcontrol"
+  readonly property string barStatsPath: dataDir + "/barstats.json"
+
+  // Hardened spawner: helpers run under a fixed absolute interpreter through
+  // the stdio-cap wrapper with a GNU timeout (own process group → group
+  // SIGTERM then SIGKILL grace) and an explicit minimal environment, so no
+  // inherited PATH/LD_* variable can influence or shadow the tooling.
+  readonly property string runnerPath: Qt.resolvedUrl("backend/run-capped.sh").toString().replace("file://", "")
+  readonly property string prefsPath: Qt.resolvedUrl("backend/prefs.py").toString().replace("file://", "")
+  readonly property int maxOutputBytes: 1048576
+  readonly property var trustedEnv: ({
+    "PATH": "/usr/bin:/bin",
+    "HOME": Quickshell.env("HOME"),
+    "OMCONTROL_DATA_DIR": root.dataDir,
+    "LC_ALL": "C"
+  })
+  // The reveal action is the one helper that must launch a GUI client, and a
+  // GUI client cannot reach the compositor without the session variables that
+  // trustedEnv deliberately strips. So it gets a separate, still-explicit
+  // environment: trustedEnv plus exactly the display/runtime vars needed, and
+  // nothing else. Every value is absolute and comes from the shell's own
+  // environment, never from the sampled data or user input.
+  readonly property var guiEnv: ({
+    "PATH": "/usr/bin:/bin",
+    "HOME": Quickshell.env("HOME"),
+    "LC_ALL": "C",
+    "WAYLAND_DISPLAY": Quickshell.env("WAYLAND_DISPLAY"),
+    "DISPLAY": Quickshell.env("DISPLAY"),
+    "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR"),
+    "XDG_DATA_DIRS": Quickshell.env("XDG_DATA_DIRS"),
+    "XDG_CURRENT_DESKTOP": Quickshell.env("XDG_CURRENT_DESKTOP"),
+    "DBUS_SESSION_BUS_ADDRESS": Quickshell.env("DBUS_SESSION_BUS_ADDRESS")
+  })
+  function capText(text) {
+    return typeof text === "string" && text.length > root.maxOutputBytes
+      ? text.slice(0, root.maxOutputBytes) : (text || "")
+  }
+
+  readonly property var metricUnits: ({ cpu: "%", mem: "%", gpu: "%", procs: "", disk: "KB/s", net: "KB/s" })
+  readonly property var sortOptions: [
+    { v: "cpu", label: "CPU" },
+    { v: "gpu", label: "GPU" },
+    { v: "mem", label: "Memory" },
+    { v: "disk", label: "Disk I/O" },
+    { v: "net", label: "Net" }
+  ]
+
+  // ---- Shared right-hand column model -------------------------------
+  // The process/app tables used to hard-code each column's offset from the
+  // right edge as a magic number repeated across ColHeader, ProcRow and
+  // AppRow (Style.space(40)/112/176/240/312/380/476). Defining the geometry
+  // once here keeps the header labels and the data cells in lockstep and makes
+  // a column a one-line change. `right` is the inset from the row's right edge
+  // (to the column's trailing edge), `width` the column's width.
+  //
+  // The insets are now derived from one uniform gutter instead of typed in per
+  // column: the hand-tuned values left 60-72px voids between most of the numeric
+  // columns, which is most of what made the rows look loosely fitted.
+  readonly property var procColumns: {
+    var gutter = Style.space(16)
+    // Right-to-left, starting from the CPU column's trailing padding.
+    var defs = [
+      { key: "cpu",   label: "CPU",   w: 60 },
+      { key: "mem",   label: "MEM",   w: 48 },
+      { key: "gpu",   label: "GPU",   w: 48 },
+      { key: "disk",  label: "DISK",  w: 56 },
+      { key: "net",   label: "NET",   w: 56 },
+      { key: "trend", label: "TREND", w: 96 },
+      { key: "pid",   label: "PID",   w: 60 }
+    ]
+    var out = []
+    var inset = Style.space(40)
+    for (var i = 0; i < defs.length; i++) {
+      out.push({ key: defs[i].key, label: defs[i].label,
+                 right: inset, width: Style.space(defs[i].w) })
+      inset += Style.space(defs[i].w) + gutter
+    }
+    return out
+  }
+  function colRight(key) {
+    for (var i = 0; i < root.procColumns.length; i++)
+      if (root.procColumns[i].key === key) return root.procColumns[i].right
+    return 0
+  }
+  function colWidth(key) {
+    for (var i = 0; i < root.procColumns.length; i++)
+      if (root.procColumns[i].key === key) return root.procColumns[i].width
+    return 0
+  }
+
+  // ---- Horizontal fit of a row: name block | trust chips | metric columns
+  // The metric columns (PID..CPU) are pinned to the row's right edge as one
+  // evenly spaced block, so everything between `rowLead` and the PID column
+  // belongs to the name block and the trust-chip slot. The name width used to be
+  // a fixed constant (240 for apps, 160 for processes) which, combined with the
+  // hand-tuned column insets, left a dead gap between the chips and the PID
+  // column. The chip column is now a FIXED-WIDTH slot pinned to the right, and
+  // the name block simply fills the space between `rowLead` and that slot — so
+  // the row is flush at any card width and the chips stay in a clean column
+  // regardless of how many chips a row shows.
+  // Declared after procColumns so the insets are guaranteed to exist first.
+  readonly property real metricsInset: colRight("pid") + colWidth("pid")
+  readonly property real chipGap: Style.space(20)   // slot -> PID column
+  readonly property real nameGap: Style.space(20)   // name block -> slot
+  // Reserved width of the trust-chip column. Sized to snugly hold the common
+  // chip sets (a trust chip on its own, or one plus the "×N" instance counter /
+  // a single perm chip) so there is no dead space beside a lone chip, while
+  // still absorbing the extra chips a busier row adds. Because it is a
+  // constant, every row's first chip starts at the same x — the chips are
+  // LEFT-aligned in the slot, which is what keeps the column visually straight
+  // regardless of how many chips a given row shows.
+  readonly property real chipSlotW: Style.space(140)
+  // Inset from the row's RIGHT edge to the chip slot's RIGHT (trailing) edge.
+  // The slot's width is added on top of this to get its leading edge, which is
+  // what the TRUST header label and the name block's right anchor are computed
+  // from — so all three stay locked together.
+  readonly property real trustInset: metricsInset + chipGap
+
+  // Shared geometry for the Verified / Unsigned trust badges. The two used to
+  // be sized independently (different padding, height, corner radius and — in
+  // the process list — different text weight and no icon on Unsigned), which
+  // made the unsigned badge read as a visibly smaller, lesser chip. Sizing both
+  // from one place guarantees they render identically.
+  readonly property real trustChipH: Style.space(16)
+  readonly property real trustChipR: Style.space(8)
+  // Fixed badge width: enough for the longer of the two labels plus its icon, so
+  // Verified and Unsigned are exactly the same size whichever is showing.
+  readonly property real trustChipW: Style.space(116)
+  readonly property var filteredAlerts: root.computeAlerts()
+  readonly property int activeAlertCount: root.filteredAlerts.length
+
+  // History-graph markers: per-kind visibility from the Alerts tab, plus the
+  // master toggle as an override. Notifications stay mode-property only.
+  readonly property var chartEvents: root.computeChartEvents()
+
+  function computeChartEvents() {
+    var alertsOn = root.alertPrefs.enabled !== false
+    var ev = root.sample.events || []
+    var out = []
+    for (var i = 0; i < ev.length; i++) {
+      if (!alertsOn) continue
+      if (!root.chartShown(root.sensitivityForKind(ev[i].kind))) continue
+      out.push(ev[i])
+    }
+    return out
+  }
+
+  // The 9 alert sensitivities for the Alerts config tab (display order).
+  // "App Activity" is the privacy-sensitive tier: it gates the runtime
+  // process-level alerts that reveal which specific process is spiky — set it
+  // to "none" to stop the app window from naming processes on screen.
+  readonly property var alertTypes: [
+    "New App Launch", "Mic or Cam Access", "Service Change", "Unsigned App Launch",
+    "Location Tracking", "New Service Launch", "App Update", "New Suspicious App",
+    "App Exit", "App Activity"
+  ]
+
+  function liveValue(key) {
+    switch (key) {
+      case "cpu": return Math.round(root.sample.cpu * 10) / 10
+      case "mem": return root.sample.mem
+      case "gpu": return root.sample.gpu
+      case "procs": return root.sample.procs
+      case "disk": return root.sample.disk
+      case "net": return "\u2193 " + root.fmtNet(root.sample.net_rx_kbs) + "   \u2191 " + root.fmtNet(root.sample.net_tx_kbs)
+      case "ctemp": return root.sample.ctemp || 0
+      case "gtemp": return root.sample.gtemp || 0
+    }
+    return 0
+  }
+
+  function fmtNet(kbs) {
+    kbs = Math.max(0, Number(kbs) || 0)
+    if (kbs >= 1048576) return (kbs / 1048576).toFixed(1) + "G"
+    if (kbs >= 1024) return (kbs / 1024).toFixed(1) + "M"
+    if (kbs >= 1) return Math.round(kbs) + "K"
+    return "0"
+  }
+
+  function fmtNetFull(kbs) {
+    kbs = Math.max(0, Number(kbs) || 0)
+    if (kbs >= 1048576) return (kbs / 1048576).toFixed(1) + " GB/s"
+    if (kbs >= 1024) return (kbs / 1024).toFixed(1) + " MB/s"
+    return Math.round(kbs) + " KB/s"
+  }
+
+  function seriesFor(metric, windowSecs) {
+    var list = windowSecs <= 3600 ? root.sample.history_1h
+             : windowSecs <= 21600 ? root.sample.history_6h
+             : root.sample.history_1d
+    var minTs = list.length ? list[list.length - 1].ts - windowSecs : 0
+    var pts = []
+    for (var i = 0; i < list.length; i++) {
+      var h = list[i]
+      if (minTs > 0 && h.ts < minTs) continue
+      var v
+      switch (metric) {
+        case "cpu": v = h.cpu; break
+        case "mem": v = h.mem_pct; break
+        case "gpu": v = h.gpu; break
+        case "procs": v = h.procs; break
+        case "disk": v = h.disk; break
+        case "net": v = (h.rx || 0) + (h.tx || 0); break
+        default: v = 0
+      }
+      pts.push({ ts: h.ts, v: v })
+    }
+    return pts
+  }
+
+  function tempSeriesFor(windowSecs) {
+    var list = windowSecs <= 3600 ? root.sample.history_1h
+             : windowSecs <= 21600 ? root.sample.history_6h
+             : root.sample.history_1d
+    var minTs = list.length ? list[list.length - 1].ts - windowSecs : 0
+    var pts = []
+    for (var i = 0; i < list.length; i++) {
+      if (minTs > 0 && list[i].ts < minTs) continue
+      pts.push({ ts: list[i].ts, ctemp: list[i].ctemp || 0, gtemp: list[i].gtemp || 0 })
+    }
+    return pts
+  }
+
+  function nearestSnap(ts) {
+    var snaps = root.sample.snaps
+    if (!snaps.length) return null
+    var best = null, bd = 1e18
+    for (var i = 0; i < snaps.length; i++) {
+      var d = Math.abs(snaps[i].ts - ts)
+      if (d < bd) { bd = d; best = snaps[i] }
+    }
+    return (bd <= 150) ? best : null
+  }
+
+  function topAt(ts, n) {
+    var snap = root.nearestSnap(ts)
+    if (!snap || !snap.procs) return []
+    var map = {}
+    var list = root.sample.p_list || []
+    for (var i = 0; i < list.length; i++) map[(list[i].name || "").toLowerCase()] = list[i]
+    var got = snap.procs.slice()
+    var isNet = root.selMetric === "net"
+    var isIo = root.selMetric === "disk"
+    got.sort(function(a, b) {
+      if (isNet) {
+        var an = (a.nr || 0) + (a.nt || 0)
+        var bn = (b.nr || 0) + (b.nt || 0)
+        if (bn !== an) return bn - an
+      }
+      if (isIo) {
+        var ai = (a.io_kbs || 0)
+        var bi = (b.io_kbs || 0)
+        if (bi !== ai) return bi - ai
+      }
+      return b.cpu - a.cpu
+    })
+    var out = []
+    for (var j = 0; j < got.length && out.length < n; j++) {
+      var e = got[j]
+      var en = map[(e.name || "").toLowerCase()] || {}
+      var copy = {}
+      for (var k in e) copy[k] = e[k]
+      copy.verified = en.verified === undefined ? 0 : en.verified
+      copy.publisher = en.publisher || "Unknown"
+      copy.perms = en.perms || []
+      copy.disabled = !!en.disabled
+      out.push(copy)
+    }
+    return out
+  }
+
+  function showRangePopup(t1, t2) {
+    root.rangeSummary = root.buildRangeSummary(t1, t2)
+  }
+
+  function rangeMetricLabel(m) {
+    if (m === "cpu") return "CPU"
+    if (m === "mem") return "Memory"
+    if (m === "gpu") return "GPU"
+    if (m === "procs") return "Processes"
+    if (m === "disk") return "Disk"
+    if (m === "net") return "Network"
+    return m
+  }
+
+  function fmtRangePeak(metric, v) {
+    if (!isFinite(v) || v < 0) return "–"
+    if (metric === "net" || metric === "disk") return Model.fmtRate(v)
+    if (metric === "procs") return Math.round(v) + ""
+    return (v >= 100 ? Math.round(v) : v.toFixed(1)) + "%"
+  }
+
+  function fmtRangeVal(metric, v) {
+    if (!isFinite(v) || v < 0) return "–"
+    if (metric === "net") return Model.fmtRate(v)
+    if (metric === "procs") return Math.round(v) + ""
+    if (metric === "disk") return Math.round(v) + " KB/s"
+    return (v >= 100 ? Math.round(v) : v.toFixed(1)) + "%"
+  }
+
+  // True when a per-minute snapshot actually carries per-app data for the
+  // pill metric (net/disk values are absent on older snapshots collected
+  // before those fields existed; a snap full of zeroes means nothing to rank).
+  function snapHasMetric(sp, metric) {
+    if (metric !== "net" && metric !== "disk") return true
+    var procs = sp.procs || []
+    for (var j = 0; j < procs.length; j++) {
+      var e = procs[j]
+      if (metric === "net" && ((e.nr || 0) + (e.nt || 0)) > 0) return true
+      if (metric === "disk" && (e.io_kbs || 0) > 0) return true
+    }
+    return false
+  }
+
+  // Aggregate everything we know about a dragged time range for the Activity
+  // popup: device-level stats from the history series plus per-app averages
+  // from the per-minute process snapshots, ranked by the selected pill's metric.
+  function buildRangeSummary(t1, t2) {
+    if (t2 < t1) { var tt = t1; t1 = t2; t2 = tt }
+    var metric = root.selMetric
+    var pts = root.chartPtsRaw
+    var sum = 0, peak = -1, ppeak = 0, n = 0
+    for (var i = 0; i < pts.length; i++) {
+      var p = pts[i]
+      if (p.ts < t1 || p.ts > t2) continue
+      sum += p.v
+      n++
+      if (p.v > peak) { peak = p.v; ppeak = p.ts }
+    }
+    var acc = {}
+    var snaps = root.sample.snaps || []
+    var nsnap = 0, nsnapData = 0
+    for (var s = 0; s < snaps.length; s++) {
+      var sp = snaps[s]
+      if (sp.ts < t1 || sp.ts > t2) continue
+      nsnap++
+      if (!root.snapHasMetric(sp, metric)) continue
+      nsnapData++
+      var procs = sp.procs || []
+      for (var j = 0; j < procs.length; j++) {
+        var e = procs[j]
+        var name = e.name || "?"
+        var rec = acc[name] || { name: name, s: 0, k: 0, srx: 0, stx: 0 }
+        var val
+        if (metric === "cpu") val = e.cpu || 0
+        else if (metric === "mem") val = e.mem || 0
+        else if (metric === "gpu") val = e.gpu || 0
+        else if (metric === "disk") val = e.io_kbs || 0
+        else if (metric === "net") val = (e.nr || 0) + (e.nt || 0)
+        else val = e.cpu || 0
+        if ((metric === "net" || metric === "disk") && val <= 0) continue
+        rec.s += val
+        rec.k++
+        rec.srx += (e.nr || 0)
+        rec.stx += (e.nt || 0)
+        acc[name] = rec
+      }
+    }
+    var list = root.sample.p_list || []
+    var map = {}
+    for (var m = 0; m < list.length; m++) map[(list[m].name || "").toLowerCase()] = list[m]
+    var rows = []
+    for (var nm in acc) {
+      var r = acc[nm]
+      var key = metric === "net" ? (r.srx + r.stx) / Math.max(1, r.k) : r.s / Math.max(1, r.k)
+      var pi = map[(nm || "").toLowerCase()] || {}
+      rows.push({ name: nm, pretty: pi.pretty_name || nm, v: key,
+                  srx: r.srx / Math.max(1, r.k), stx: r.stx / Math.max(1, r.k) })
+    }
+    rows.sort(function(a, b) { return b.v - a.v })
+    if (rows.length > 10) rows.length = 10
+    return { t1: t1, t2: t2, metric: metric, mlabel: root.rangeMetricLabel(metric),
+             nsnap: nsnap, nsnapData: nsnapData, devAvg: n > 0 ? sum / n : 0, devPeak: peak < 0 ? null : peak,
+             peakAt: ppeak ? root.fmtTime(ppeak) : "", rows: rows }
+  }
+
+  function fmtTime(ts) {
+    return Qt.formatTime(new Date(ts * 1000), "HH:mm:ss")
+  }
+
+  function fmtAgo(ts) {
+    var s = Math.max(0, Math.floor(Date.now() / 1000 - ts))
+    if (s < 60) return "just now"
+    if (s < 3600) return Math.floor(s / 60) + "m ago"
+    if (s < 86400) return Math.floor(s / 3600) + "h ago"
+    return Math.floor(s / 86400) + "d ago"
+  }
+
+  function fmtFullDate(ts) {
+    return Qt.formatDateTime(new Date(ts * 1000), "yyyy-MM-dd HH:mm:ss")
+  }
+
+  // Semantic color for an event kind, resolved against the live theme. The
+  // kind -> role mapping lives in Model.js (pure JS, no Color singleton); the
+  // role -> themed color resolution happens here.
+  function eventColor(kind) {
+    switch (Model.eventRole(kind)) {
+      case "ok": return root.ok
+      case "danger": return root.urgent
+      case "info": return root.info
+      case "warn": return root.warn
+      case "action": return root.action
+      default: return root.neutral
+    }
+  }
+  // Back-compat alias; new paint paths use eventColor().
+  function eventTypeColor(kind) { return root.eventColor(kind) }
+  // Canvas2D can't alpha-blend a QML color directly, so convert to an
+  // "rgba(r,g,b,a)" string. Accepts either a QML color or a "#RRGGBB" hex.
+  function hexRgba(col, alpha) {
+    if (col && typeof col === "object" && col.r !== undefined)
+      return "rgba(" + Math.round(col.r * 255) + ","
+          + Math.round(col.g * 255) + ","
+          + Math.round(col.b * 255) + "," + alpha + ")"
+    var h = String(col || "#888888").replace("#", "")
+    if (h.length < 6) h = "888888"
+    return "rgba(" + parseInt(h.substring(0, 2), 16) + ","
+        + parseInt(h.substring(2, 4), 16) + ","
+        + parseInt(h.substring(4, 6), 16) + "," + alpha + ")"
+  }
+  function eventIcon(kind) { return Model.eventIcon(kind) }
+  function eventKindLabel(kind) {
+    if (kind === "app_launch" || kind === "new_app") return "Launch"
+    if (kind === "app_exit") return "Exit"
+    if (kind === "cpu_spike" || kind === "mem_spike") return "Spike"
+    if (kind === "mic_access") return "Mic access"
+    if (kind === "cam_access") return "Camera access"
+    if (kind === "location_access") return "Location access"
+    if (kind === "permission") return "Permission"
+    if (kind === "publisher_block" || kind === "unsigned_launch" || kind === "unknown_app") return "Security"
+    if (kind === "suspicious_app") return "Suspicious app"
+    if (kind === "service_change") return "Service change"
+    if (kind === "service_launch") return "Service launch"
+    if (kind === "app_update") return "App update"
+    if (kind.indexOf("user_") === 0) return "Action"
+    return (kind || "Event").toUpperCase()
+  }
+
+  function eventKindExplain(kind) {
+    switch (kind) {
+      case "app_launch":
+      case "new_app": return "An application was launched. First-seen launches are recorded so you can spot something that started running without you realising."
+      case "app_exit": return "A previously-running application exited (left the process list)."
+      case "cpu_spike": return "System CPU load across all cores peaked above 95% during a 0.2s sample window."
+      case "mem_spike": return "System memory usage exceeded 92% — only a small amount of RAM was free at that moment."
+      case "mic_access": return "An application accessed the microphone."
+      case "cam_access": return "An application accessed the camera."
+      case "location_access": return "An application accessed location data."
+      case "permission": return "An application was granted access to a sensitive permission."
+      case "publisher_block": return "An executable without a known, verifiable publisher was launched and blocked by your policy."
+      case "unsigned_launch": return "A binary that does not come from a verified, signed package was started — it was not in the trusted catalog."
+      case "unknown_app": return "A process with no registered package or publisher started. It is not in the app catalog at all, so nothing can be verified about its origin."
+      case "suspicious_app": return "This binary matched suspicion heuristics (unusual path, name, or origin) and was flagged."
+      case "service_change": return "A system service was started or stopped."
+      case "service_launch": return "A system service was launched."
+      case "app_update": return "An installed application was updated."
+      default:
+        if (kind.indexOf("user_") === 0) return "A manual action (allow, disable or enable) taken from the OmaControl UI."
+        return (kind || "System event") + " was logged by the system monitor."
+    }
+  }
+
+  // Build a Google query for an event: quoted app name, a symptom/kind term,
+  // the publisher (when known), and a "linux" scoping word so the search lands
+  // on relevant context rather than generic marketing pages.
+  function eventSearchQuery(ev) {
+    var kind = ev.kind || ""
+    var app = ev.app || ""
+    var pub = ev.publisher || ""
+    var term = ""
+    if (kind === "cpu_spike") term = "high cpu usage"
+    else if (kind === "mem_spike") term = "high memory usage"
+    else if (kind === "mic_access") term = "microphone access"
+    else if (kind === "cam_access") term = "camera access"
+    else if (kind === "location_access") term = "location access"
+    else if (kind === "publisher_block") term = "unsigned app blocked"
+    else if (kind === "unsigned_launch") term = "unsigned app launch"
+    else if (kind === "unknown_app") term = "unknown app process"
+    else if (kind === "suspicious_app") term = "suspicious app"
+    else if (kind === "service_change") term = "system service changed"
+    else if (kind === "service_launch") term = "system service launch"
+    else if (kind === "app_launch" || kind === "new_app") term = "new application launch"
+    else if (kind === "app_exit") term = "application exit"
+    else if (kind === "app_update") term = "application update"
+    else if (kind.indexOf("user_") !== 0) term = "linux system event"
+    var parts = []
+    if (app) parts.push('"' + app + '"')
+    if (term) parts.push(term)
+    if (pub && pub !== "Unknown") parts.push(pub)
+    parts.push("linux")
+    return parts.join(" ")
+  }
+
+  // Open the default browser on a Google search explaining this event. Hyprland
+  // leaves the new tab unfocused, so follow up with focus-browser.sh to bring
+  // the search window to the foreground.
+  function openEventSearch(ev) {
+    Qt.openUrlExternally("https://www.google.com/search?q="
+        + encodeURIComponent(root.eventSearchQuery(ev || {})))
+    root.runBackend("focus-browser.sh", [])
+  }
+
+  // Merge the running apps with the known-apps catalog into one inventory,
+  // apply the search + activity + disabled filters, and sort.
+  function renderApps() {
+    var q = root.appSearch.trim().toLowerCase()
+    var byName = {}
+    var src = root.sample.apps || []
+    var cat = root.sample.catalog || []
+    var i, a
+    for (i = 0; i < src.length; i++) {
+      var srcNm = (src[i].name || "").toLowerCase()
+      byName[srcNm] = src[i]
+      byName[srcNm].running = true
+    }
+    for (i = 0; i < cat.length; i++) {
+      var nm = cat[i].name || ""
+      var k = nm.toLowerCase()
+      if (byName[k]) {
+        byName[k].running = true
+        byName[k].disabled = cat[i].disabled
+      } else {
+        byName[k] = { name: nm, cpu: 0, mem: 0, io: 0, gpu: 0, pids: [], spark: [],
+                      publisher: cat[i].publisher, verified: cat[i].verified,
+                      source: cat[i].source, desc: cat[i].desc,
+                      perms: cat[i].perms || [], disabled: cat[i].disabled, running: false }
+      }
+    }
+    var out = []
+    for (var key in byName) out.push(byName[key])
+    if (q !== "") {
+      out = out.filter(function(a) {
+        return (a.name || "").toLowerCase().indexOf(q) >= 0
+            || (a.publisher || "").toLowerCase().indexOf(q) >= 0
+      })
+    }
+    if (root.activityFilter === "running") out = out.filter(function(a) { return a.running })
+    if (root.activityFilter === "not") out = out.filter(function(a) { return !a.running })
+    if (root.showDisabledOnly) out = out.filter(function(a) { return a.disabled })
+    out.sort(function(a, b) {
+      if (a.running !== b.running) return a.running ? -1 : 1
+      return (root.sortVal(b, root.appSort) || 0) - (root.sortVal(a, root.appSort) || 0)
+    })
+    root.filteredApps = out.slice(0, 400)
+  }
+
+  function confirmedDisable(name) {
+    // Disabling is persistent and cannot be undone by a restart — always
+    // ask for explicit confirmation from the panel level.
+    confirmBar.show(name)
+  }
+
+  function computeAlerts() {
+    var src = root.sample.alerts || []
+    var f = root.alertFilter
+    var out = []
+    for (var i = 0; i < src.length; i++) {
+      var a = src[i]
+      if (a.priv === true && root.alertMode("App Activity") === "none") continue
+      if (f === "critical" && a.severity !== "critical") continue
+      if (f === "info" && a.severity !== "info") continue
+      if (root.dismissedAlerts.indexOf(a.kind + "|" + a.ts + "|" + a.msg) >= 0) continue
+      out.push(a)
+    }
+    return out
+  }
+
+  // Event kinds by filter bucket (spec: superset of entry types).
+  function bucketKinds(f) {
+    switch (f) {
+      case "new_app": return ["app_launch"]
+      case "exit": return ["app_exit"]
+      case "security": return ["unsigned_launch", "publisher_block", "unknown_app"]
+      case "permission": return ["mic_access", "cam_access", "location_access", "permission"]
+      case "user": return ["user_kill", "user_disable", "user_enable", "user_pause", "user_resume", "user_priority"]
+      case "spike": return ["cpu_spike", "mem_spike"]
+      default: return null
+    }
+  }
+
+  function computeEvents() {
+    var src = root.sample.events || []
+    var kinds = root.bucketKinds(root.eventFilter)
+    var q = root.eventSearch.trim().toLowerCase()
+    var out = []
+    for (var i = 0; i < src.length; i++) {
+      var e = src[i]
+      if (kinds && kinds.indexOf(e.kind) < 0) continue
+      if (q !== "") {
+        var hay = ((e.app || "") + " " + (e.publisher || "") + " " + (e.msg || "")).toLowerCase()
+        if (hay.indexOf(q) < 0) continue
+      }
+      out.push(e)
+    }
+    root.filteredEvents = out.slice(0, 200)
+    return root.filteredEvents
+  }
+
+  function updateBadges() {
+    var alertsOn = root.alertPrefs.enabled !== false
+    var alerts = root.sample.alerts || []
+    var crit = 0
+    for (var i = 0; i < alerts.length; i++) {
+      if (alerts[i].severity !== "critical") continue
+      if (alerts[i].priv === true && root.alertMode("App Activity") === "none") continue
+      crit++
+    }
+    root.alertBadge = alertsOn ? crit : 0
+    var ev = root.sample.events || []
+    var unread = 0
+    for (var j = 0; j < ev.length; j++) {
+      if (!alertsOn || ev[j].read) continue
+      var sens = root.sensitivityForKind(ev[j].kind)
+      if (sens && root.alertMode(sens) === "none") continue
+      unread++
+    }
+    root.eventBadge = unread
+  }
+
+  function appAction(action, name) {
+    appActionProc.command = ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+      Qt.resolvedUrl("backend/app-action.sh").toString().replace("file://", ""),
+      action, name]
+    appActionProc.running = true
+  }
+
+  function loadStats(nm) {
+    if (!nm) { root.detailStats = null; return }
+    root.detailStatsBusy = true
+    statsProc.command = ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+      Qt.resolvedUrl("backend/app-stats.sh").toString().replace("file://", ""), nm]
+    statsProc.running = true
+  }
+
+  // Open the details panel for a named app by looking it up in the same
+  // inventory the Apps list is built from. Setting detailApp triggers
+  // onDetailAppChanged, which kicks off the stats/net/process loads — so this
+  // is exactly the same path a row click takes. Reachable over IPC so the
+  // panel can be opened from a keybinding or script.
+  function showDetails(name) {
+    if (!name) return false
+    var list = root.filteredApps || []
+    for (var i = 0; i < list.length; i++) {
+      if ((list[i].name || "") === name) {
+        root.open = true
+        root.detailApp = list[i]
+        return true
+      }
+    }
+    return false
+  }
+
+  function loadEventContext(ev) {
+    root.eventCtx = null
+    root.eventCtxBusy = true
+    var args = ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+                Qt.resolvedUrl("backend/event-context.sh").toString().replace("file://", ""),
+                "" + (ev && ev.ts ? ev.ts : 0), (ev && ev.app) || "", (ev && ev.kind) || ""]
+    eventCtxProc.command = args
+    eventCtxProc.running = true
+  }
+
+  function isBarPref(id) { return (root.barPrefs.stats || []).indexOf(id) >= 0 }
+  function barPrefPreview() {
+    var list = root.barPrefs.stats || []
+    if (root.barPrefs.mode === "none") return "(values only, no names)"
+    var out = []
+    for (var i = 0; i < list.length; i++) {
+      var lead = Model.barStatLabel(list[i])
+      if (lead) out.push(lead)
+    }
+    return out.length ? out.join("  ") : "(no stats selected)"
+  }
+  function toggleBarPref(id) {
+    var list = (root.barPrefs.stats || []).slice()
+    var i = list.indexOf(id)
+    if (i >= 0) list.splice(i, 1); else list.push(id)
+    root.barPrefs = { stats: list, mode: root.barPrefs.mode || "name", barShowBell: root.barPrefs.barShowBell !== false, showBuyButton: root.barPrefs.showBuyButton !== false }
+    root.saveBarPrefs()
+  }
+  function setBarPrefMode(m) {
+    if (m !== "name" && m !== "none") return
+    root.barPrefs = { stats: root.barPrefs.stats || [], mode: m, barShowBell: root.barPrefs.barShowBell !== false, showBuyButton: root.barPrefs.showBuyButton !== false }
+    root.saveBarPrefs()
+  }
+  function resetBarPrefs() {
+    root.barPrefs = { stats: ["cpu", "cputemp"], mode: "name", barShowBell: true, showBuyButton: true }
+    root.saveBarPrefs()
+  }
+  function setBarShowBell(on) {
+    root.barPrefs = { stats: root.barPrefs.stats || [], mode: root.barPrefs.mode || "name", barShowBell: !!on, showBuyButton: root.barPrefs.showBuyButton !== false }
+    root.saveBarPrefs()
+    root.runBackend("bar-prefs.sh", ["set-show-bell", on ? "on" : "off"])
+  }
+  function setShowBuyButton(on) {
+    root.barPrefs = { stats: root.barPrefs.stats || [], mode: root.barPrefs.mode || "name", barShowBell: root.barPrefs.barShowBell !== false, showBuyButton: !!on }
+    root.saveBarPrefs()
+  }
+  function openBuyMeACoffee() {
+    Qt.openUrlExternally("https://ko-fi.com/davedes")
+  }
+  function saveBarPrefs() {
+    var payload = JSON.stringify({ stats: root.barPrefs.stats || [], mode: root.barPrefs.mode || "name", barShowBell: root.barPrefs.barShowBell !== false, showBuyButton: root.barPrefs.showBuyButton !== false })
+    barPrefsSaveProc.command = ["/usr/bin/timeout", "-k", "2", "5", "/bin/sh", root.runnerPath, "/usr/bin/python3",
+                                root.prefsPath, "write"]
+    barPrefsSaveProc.pending = payload
+    barPrefsSaveProc.running = false
+    barPrefsSaveProc.running = true
+  }
+  function loadBarPrefs() {
+    barPrefsLoadProc.command = ["/usr/bin/timeout", "-k", "2", "5", "/bin/sh", root.runnerPath, "/usr/bin/python3",
+                                root.prefsPath, "read"]
+    barPrefsLoadProc.running = true
+  }
+  function loadPerProcNet() {
+    metricsPrefsLoadProc.command = ["/usr/bin/timeout", "-k", "2", "5", "/bin/sh", root.runnerPath, "/usr/bin/python3",
+                                    root.prefsPath, "read", root.dataDir + "/metrics_prefs.json"]
+    metricsPrefsLoadProc.running = true
+  }
+  function setPerProcNet(on) {
+    root.perProcNet = !!on
+    var payload = JSON.stringify({ perProcNet: root.perProcNet })
+    metricsPrefsSaveProc.command = ["/usr/bin/timeout", "-k", "2", "5", "/bin/sh", root.runnerPath, "/usr/bin/python3",
+                                    root.prefsPath, "write", root.dataDir + "/metrics_prefs.json"]
+    metricsPrefsSaveProc.pending = payload
+    metricsPrefsSaveProc.running = false
+    metricsPrefsSaveProc.running = true
+  }
+
+  function loadNet(nm) {
+    if (!nm) { root.detailNet = null; return }
+    root.detailNetBusy = true
+    netProc.command = ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+      Qt.resolvedUrl("backend/app-net.sh").toString().replace("file://", ""), nm]
+    netProc.running = true
+  }
+
+  function loadProcDetail(nm) {
+    if (!nm) {
+      root.procDetail = []
+      return
+    }
+    root.procDetailBusy = true
+    procDetailProc.command = ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/usr/bin/python3",
+      Qt.resolvedUrl("backend/process-detail.sh").toString().replace("file://", ""), nm]
+    procDetailProc.running = true
+  }
+
+  function pidsFor(name) {
+    var arr = root.sample.p_list || []
+    var out = []
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i].name === name && arr[i].pid) out.push(arr[i].pid)
+    }
+    return out
+  }
+
+  // Reveal a path in the desktop file manager.
+  // The user-facing goal is "take me to the file location", so we hand the
+  // CONTAINING DIRECTORY to the desktop's own handler rather than the binary —
+  // a bare ELF has no .desktop association, so xdg-open on the file itself
+  // would either do nothing or fall through to a random application.
+  //
+  // Always `gio open` unless explicitly overridden: gio resolves the
+  // inode/directory MIME type properly, whereas xdg-open on a bare directory
+  // path mis-routed to the browser on this system. gio picks the user's real
+  // default file manager.
+  //
+  // OMCONTROL_FILE_MANAGER=nautilus|caja forces a specific manager, which
+  // additionally gets the nicer "--select the file in its folder" behaviour.
+  // (nautilus is installed here but cannot start — "Failed to initialize
+  // display server" — so it is never chosen automatically.)
+  //
+  // Launched via setsid so the opener becomes its own session leader and keeps
+  // running after the wrapper exits — without it the file manager is torn down
+  // with the Process and no window ever appears. The timeout only bounds
+  // gio's own startup, not the manager's lifetime.
+  //
+  // Only ever called with a path that came from /proc via process-detail.sh —
+  // never user input — and it still goes out as an argv vector, so a crafted
+  // path cannot smuggle in options the way a shell string would.
+  function revealPath(path) {
+    if (!path || path.charAt(0) !== "/") return false
+    var manager = Quickshell.env("OMCONTROL_FILE_MANAGER") || ""
+    if (manager === "nautilus" || manager === "caja") {
+      actionProc.command = ["/usr/bin/setsid", "/usr/bin/timeout", "-k", "2", "10",
+                            "/usr/bin/" + manager, "--select", path]
+    } else {
+      var dir = path
+      if (path.indexOf("/") > 0) dir = path.slice(0, path.lastIndexOf("/"))
+      if (dir === "") dir = "/"
+      actionProc.command = ["/usr/bin/setsid", "/usr/bin/timeout", "-k", "2", "10",
+                            "/usr/bin/gio", "open", dir]
+    }
+    actionProc.running = false
+    actionProc.running = true
+    return true
+  }
+
+  // Resolve which path to reveal for a process row: the binary if we could
+  // read it, otherwise the working directory.
+  function procOpenPath(proc) {
+    if (!proc) return ""
+    if (proc.exe && proc.exe.charAt(0) === "/") return proc.exe
+    if (proc.cwd && proc.cwd.charAt(0) === "/") return proc.cwd
+    return ""
+  }
+
+  // Open the binary of a given pid from the currently loaded process list.
+  // Reachable over IPC so a row's target can be opened from a script.
+  function openProcPath(pid) {
+    var arr = root.procDetail || []
+    for (var i = 0; i < arr.length; i++) {
+      if (Number(arr[i].pid) === Number(pid)) return root.revealPath(root.procOpenPath(arr[i]))
+    }
+    return false
+  }
+
+  function toggleProcRows() {
+    detailsPanel.procOpen = !detailsPanel.procOpen
+    if (!detailsPanel.procOpen) detailsPanel.procShowAll = false
+    return detailsPanel.procOpen
+  }
+
+  function procRowsInfo() {
+    return JSON.stringify({ open: detailsPanel.procOpen, n: (root.procDetail || []).length })
+  }
+
+  function fmtDur(s) {
+    s = Math.max(0, Math.floor(s || 0))
+    var d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60)
+    if (d > 0) return d + "d " + h + "h"
+    if (h > 0) return h + "h " + m + "m"
+    if (m > 0) return m + "m " + (s % 60) + "s"
+    return s + "s"
+  }
+
+  // Disable with confirm; enable is non-destructive so goes straight through.
+  function disableApp(name) { root.confirmedDisable(name) }
+  function enableApp(name) { root.appAction("enable", name) }
+
+  function dismissAlert(key) {
+    var arr = root.dismissedAlerts.slice()
+    if (arr.indexOf(key) < 0) arr.push(key)
+    root.dismissedAlerts = arr
+  }
+
+  function sparksFor(name) {
+    var snaps = root.sample.snaps
+    var out = []
+    for (var i = 0; i < snaps.length; i++) {
+      var procs = snaps[i].procs
+      var v = -1
+      for (var j = 0; j < procs.length; j++) {
+        if (procs[j].name === name) { v = procs[j].cpu; break }
+      }
+      out.push(v)
+    }
+    return out
+  }
+
+  function renderList() {
+    var q = root.search.trim().toLowerCase()
+    var out = []
+    for (var i = 0; i < root.sample.p_list.length; i++) {
+      var p = root.sample.p_list[i]
+      if (q !== "" && (p.name || "").toLowerCase().indexOf(q) < 0) continue
+      out.push(p)
+    }
+    out.sort(function(a, b) { return root.sortVal(b, root.procSort) - root.sortVal(a, root.procSort) })
+    root.filteredProcs = out
+  }
+
+  // Live per-process resource value used by the sort dropdowns.
+  function sortVal(p, key) {
+    switch (key) {
+      case "gpu":  return p.gpu || 0
+      case "mem":  return p.mem || 0
+      case "disk": return p.io_kbs || p.io || 0
+      case "net":  return p.net_kbs || p.net || 0
+      case "cpu":
+      default:     return p.cpu || 0
+    }
+  }
+
+  function onSampleReceived() {
+    root.alertPrefs = root.sample.alert_prefs || { enabled: true, types: {}, charts: {} }
+    root.alertProfile = root.sample.alert_profile || "medium"
+    root.alertThresholds = root.sample.alert_thresholds || {}
+    root.renderList()
+    root.renderApps()
+    root.updateBadges()
+    root.computeEvents()
+  }
+
+  // ---- persistence helpers (events read state + alert prefs) ----
+  function runBackend(script, args) {
+    var full = ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+                Qt.resolvedUrl("backend/" + script).toString().replace("file://", "")].concat(args)
+    actionProc.command = full
+    actionProc.running = true
+  }
+  function markEventRead(id) { root.runBackend("events.sh", ["read", "" + id]) ; missingNsTimer() }
+  function markAllEventsRead() { root.runBackend("events.sh", ["read-all"]); missingNsTimer() }
+  function clearEvents() { root.runBackend("events.sh", ["clear"]); missingNsTimer() }
+  function setAlertPref(type, mode) { root.runBackend("alert-prefs.sh", ["set", type, mode]) }
+  function setAlertsEnabled(on) { root.runBackend("alert-prefs.sh", ["set-enabled", on ? "on" : "off"]) }
+  function setAlertProfile(p) {
+    root.alertProfile = p
+    root.runBackend("alert-prefs.sh", ["set-profile", p])
+    root.refreshSoon()
+  }
+  function setAlertMode(type, mode) {
+    var types = {}; var src = root.alertPrefs.types || {}
+    for (var k in src) types[k] = src[k]
+    types[type] = mode
+    root.alertPrefs = ({ "enabled": root.alertPrefs.enabled, "types": types, "charts": root.alertPrefs.charts || {} })
+    root.setAlertPref(type, mode)
+    root.refreshSoon()
+  }
+
+  function setChartToggle(type, on) {
+    var charts = {}; var src = root.alertPrefs.charts || {}
+    for (var k in src) charts[k] = src[k]
+    charts[type] = on
+    root.alertPrefs = ({ "enabled": root.alertPrefs.enabled, "types": root.alertPrefs.types || {}, "charts": charts })
+    root.runBackend("alert-prefs.sh", ["set-chart", type, on ? "on" : "off"])
+    root.refreshSoon()
+  }
+
+  // Whether chart markers for an event kind are shown (defaults to shown).
+  function chartShown(type) {
+    if (!type) return true
+    return (root.alertPrefs.charts || {})[type] !== false
+  }
+
+  // Normalized per-sensitivity notification mode: "toast" | "notify" | "none".
+  // Handles legacy boolean prefs (true meant notify, but toast for new apps).
+  function alertMode(type) {
+    var v = (root.alertPrefs.types || {})[type]
+    if (type === "App Activity" && v === undefined) return "notify"
+    if (v === true) return type === "New App Launch" ? "toast" : "notify"
+    if (v === false) return "none"
+    if (v === "toast" || v === "notify" || v === "none") return v
+    return "none"
+  }
+
+  // Event kind → alert sensitivity label (bell-badge gating).
+  // Every kind the toast funnel knows is mapped so a "none" mode can silence
+  // the bell for it; kinds without a mapping always count when alerts are on.
+  function sensitivityForKind(kind) {
+    var map = {
+      "app_launch": "New App Launch",
+      "app_exit": "App Exit",
+      "mic_access": "Mic or Cam Access", "cam_access": "Mic or Cam Access", "permission": "Mic or Cam Access",
+      "location_access": "Location Tracking",
+      "unsigned_launch": "Unsigned App Launch", "unknown_app": "Unsigned App Launch", "publisher_block": "Unsigned App Launch",
+      "suspicious_app": "New Suspicious App",
+      "service_change": "Service Change",
+      "service_launch": "New Service Launch",
+      "app_update": "App Update"
+    }
+    return map[kind] || null
+  }
+  function refreshSoon() { refreshTimer.start() }
+
+  onSampleChanged: root.onSampleReceived()
+  onSearchChanged: root.renderList()
+  onAppSearchChanged: root.renderApps()
+  onActivityFilterChanged: root.renderApps()
+  onShowDisabledOnlyChanged: root.renderApps()
+  onProcSortChanged: root.renderList()
+  onAppSortChanged: root.renderApps()
+  onEventSearchChanged: root.computeEvents()
+  onEventFilterChanged: root.computeEvents()
+
+  function onSample(text) {
+    try {
+      root.sample = JSON.parse(text)
+    } catch (e) {}
+    if (root.open) sampleTimer.start()
+  }
+
+  // ---- Data loop ----
+  Timer {
+    id: sampleTimer
+    interval: 4000
+    repeat: false
+    running: false
+    onTriggered: {
+      if (root.open && !root.sampleProcRunning) {
+        root.sampleProcRunning = true
+        sampleProc.running = true
+      }
+    }
+  }
+
+  Process {
+    id: sampleProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    command: ["/usr/bin/timeout", "-k", "2", "10", "/bin/sh", root.runnerPath, "/bin/sh",
+              Qt.resolvedUrl("backend/sample-json.sh").toString().replace("file://", "")]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onSample(root.capText(text))
+    }
+    onRunningChanged: {
+      if (!running) {
+        root.sampleProcRunning = false
+        if (root.open) sampleTimer.start()
+      }
+    }
+  }
+
+  Process {
+    id: appActionProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+  }
+  Process {
+    id: statsProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.detailStatsBusy = false
+        try {
+          var parsed = JSON.parse(root.capText(text))
+          root.detailStats = parsed && parsed.name ? parsed : null
+        } catch (e) { root.detailStats = null }
+      }
+    }
+  }
+  Process {
+    id: netProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.detailNetBusy = false
+        try {
+          var parsed = JSON.parse(root.capText(text))
+          root.detailNet = parsed ? parsed : null
+        } catch (e) { root.detailNet = null }
+      }
+    }
+  }
+  Process {
+    id: procDetailProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.procDetailBusy = false
+        try {
+          var parsed = JSON.parse(root.capText(text))
+          root.procDetail = (parsed && parsed.pids) ? parsed.pids : []
+        } catch (e) { root.procDetail = [] }
+      }
+    }
+  }
+  Process {
+    id: eventCtxProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.eventCtxBusy = false
+        try {
+          var parsed = JSON.parse(root.capText(text))
+          root.eventCtx = (parsed && parsed.ok) ? parsed : null
+        } catch (e) { root.eventCtx = null }
+      }
+    }
+  }
+  Process {
+    id: barPrefsLoadProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(root.capText(text))
+          if (Array.isArray(parsed)) root.barPrefs = { stats: parsed, mode: root.barPrefs.mode || "name" }
+          else if (parsed && parsed.stats) root.barPrefs = { stats: parsed.stats, mode: ["name","none"].indexOf(parsed.mode) >= 0 ? parsed.mode : "name" }
+          root.barPrefs = { stats: root.barPrefs.stats || [], mode: root.barPrefs.mode || "name", barShowBell: parsed.barShowBell !== false, showBuyButton: parsed.showBuyButton !== false }
+        } catch (e) {}
+        root.barPrefsLoaded = true
+      }
+    }
+  }
+  Process {
+    id: barPrefsSaveProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdinEnabled: true
+    property string pending: ""
+    onStarted: {
+      if (barPrefsSaveProc.pending !== "") barPrefsSaveProc.write(barPrefsSaveProc.pending)
+      barPrefsSaveProc.stdinEnabled = false
+    }
+    onExited: function(exitCode, exitStatus) {
+      if (barPrefsSaveProc.stdinEnabled === false) barPrefsSaveProc.stdinEnabled = true
+      barPrefsSaveProc.pending = ""
+    }
+  }
+  Process {
+    id: metricsPrefsLoadProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var p = JSON.parse(root.capText(text))
+          root.perProcNet = p.perProcNet !== false
+        } catch (e) {}
+      }
+    }
+  }
+  Process {
+    id: metricsPrefsSaveProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    stdinEnabled: true
+    property string pending: ""
+    onStarted: {
+      if (metricsPrefsSaveProc.pending !== "") metricsPrefsSaveProc.write(metricsPrefsSaveProc.pending)
+      metricsPrefsSaveProc.stdinEnabled = false
+    }
+    onExited: function(exitCode, exitStatus) {
+      if (metricsPrefsSaveProc.stdinEnabled === false) metricsPrefsSaveProc.stdinEnabled = true
+      metricsPrefsSaveProc.pending = ""
+    }
+  }
+  Process {
+    id: actionProc
+    clearEnvironment: true
+    // GUI-capable environment: this process launches a desktop file manager,
+    // which needs the Wayland/X/Runtime session variables.
+    environment: root.guiEnv
+  }
+  Timer { id: refreshTimer; interval: 5000; repeat: false; running: false
+    onTriggered: { if (root.open) sampleProc.running = true }
+  }
+  function missingNsTimer() { refreshTimer.start() }
+
+  onDetailAppChanged: {
+    root.loadStats(root.detailApp ? root.detailApp.name : "")
+    root.loadNet(root.detailApp ? root.detailApp.name : "")
+    root.loadProcDetail(root.detailApp ? root.detailApp.name : "")
+  }
+  onOpenChanged: {
+    if (root.open) {
+      if (!root.sampleProcRunning) {
+        root.sampleProcRunning = true
+        sampleProc.running = true
+      }
+      root.activeTab = 0
+      root.drillProcs = null
+    }
+  }
+  onActiveTabChanged: {
+    if (root.activeTab === 2) root.alertsSeenTs = Math.floor(Date.now() / 1000)
+    if (root.activeTab === 3) root.eventSeenTs = Math.floor(Date.now() / 1000)
+    if (root.activeTab === 4 && !root.barPrefsLoaded) {
+      root.loadBarPrefs()
+      root.loadPerProcNet()
+    }
+    root.updateBadges()
+  }
+
+  // ================================================================ UI
+  // Scrim: themed dim wash behind the modal card; outside-click closes.
+  Rectangle {
+    anchors.fill: parent
+    z: 0
+    color: Color.menu.scrim
+    TapHandler {
+      onTapped: root.open = false
+    }
+  }
+
+  BorderSurface {
+    id: card
+    z: 1
+    width: Math.min(root.compact ? Style.space(900) : Style.space(1100), root.width - Style.space(40))
+    // Compact grew from 170 to 224 to make room for the bottom nav rail. At 170
+    // the header (48) + separator (1) + nav (46) left the chart ~43px once the
+    // Activity page's 16px margins were applied, which crushed the plot and its
+    // x-axis labels. 224 keeps a usable chart height with the tabs present.
+    height: Math.min(root.compact ? Style.space(224) : Style.space(880), root.height - Style.space(40))
+    anchors.centerIn: parent
+    radius: Style.cornerRadius
+    color: root.surface
+    borderSpec: root.cardBorderSpec
+    clip: true
+    Behavior on height { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+    Behavior on width { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+
+    // Consume clicks on the card body so they never reach the scrim.
+    MouseArea { anchors.fill: parent }
+
+    ColumnLayout {
+      id: bodyCol
+      anchors.fill: parent
+      spacing: 0
+
+      // ==================== Top bar (PanelHero)
+      Item {
+        Layout.fillWidth: true
+        Layout.preferredHeight: root.compact ? Style.space(48) : Style.space(64)
+
+        PanelHero {
+          id: headerHero
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(18)
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(18)
+          anchors.verticalCenter: parent.verticalCenter
+          title: "OmaControl"
+          // Uppercased meta line (letterSpacing comes from PanelHero) carries the
+          // rotating tagline, so the header reads with the same rhythm as the
+          // first-party Omarchy panels.
+          meta: root.compact ? "MONITORING" : root.subtitleText
+          foreground: root.fg
+          fontFamily: root.contentFontFamily
+          iconComponent: Component {
+            Item {
+              width: Style.space(34)
+              height: Style.space(34)
+              BorderSurface {
+                anchors.fill: parent
+                radius: Style.cornerRadius
+                color: root.accentSoft
+                borderSpec: Border.flat(Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.5), 1)
+              }
+              Text {
+                anchors.centerIn: parent
+                text: "\uf201"
+                color: root.accent
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.title
+              }
+            }
+          }
+          trailingControl: Component {
+            OMCPill {
+              label: root.compact ? "\uf065  Expand" : "\uf066  Compact"
+              active: false
+              onChosen: root.compact = !root.compact
+            }
+          }
+        }
+      }
+
+      PanelSeparator {
+        Layout.fillWidth: true
+        Layout.preferredHeight: 1
+        foreground: root.fg
+      }
+
+      // ==================== Body (pages)
+      Item {
+        Layout.fillWidth: true
+        Layout.fillHeight: true
+        clip: true
+
+        // ---- Activity page
+        Item {
+          visible: root.activeTab === 0
+          anchors.fill: parent
+          // Tighter margins in compact: the card is only 224px tall and the
+          // 16px inset costs the chart a third of its remaining height.
+          anchors.margins: Style.space(root.compact ? 8 : 16)
+
+          Row {
+            id: metricRow
+            visible: !root.compact
+            anchors.top: parent.top
+            anchors.left: parent.left
+            spacing: Style.space(12)
+
+            OMCPill { label: "CPU"; value: root.liveValue("cpu") + "%"; active: root.selMetric === "cpu"; onChosen: { root.selMetric = "cpu"; if (root.rangeSummary) root.rangeSummary = root.buildRangeSummary(root.rangeSummary.t1, root.rangeSummary.t2) } }
+            OMCPill { label: "Memory"; value: root.liveValue("mem") + "%"; active: root.selMetric === "mem"; onChosen: { root.selMetric = "mem"; if (root.rangeSummary) root.rangeSummary = root.buildRangeSummary(root.rangeSummary.t1, root.rangeSummary.t2) } }
+            OMCPill { label: "GPU"; value: root.liveValue("gpu") + "%"; active: root.selMetric === "gpu"; onChosen: { root.selMetric = "gpu"; if (root.rangeSummary) root.rangeSummary = root.buildRangeSummary(root.rangeSummary.t1, root.rangeSummary.t2) } }
+            OMCPill { label: "Processes"; value: Math.round(root.liveValue("procs")); active: root.selMetric === "procs"; onChosen: { root.selMetric = "procs"; if (root.rangeSummary) root.rangeSummary = root.buildRangeSummary(root.rangeSummary.t1, root.rangeSummary.t2) } }
+            OMCPill { label: "Disk"; value: "\u2193 " + root.fmtNet(root.sample.disk_r) + "  \u2191 " + root.fmtNet(root.sample.disk_w); active: root.selMetric === "disk"; onChosen: { root.selMetric = "disk"; if (root.rangeSummary) root.rangeSummary = root.buildRangeSummary(root.rangeSummary.t1, root.rangeSummary.t2) } }
+            OMCPill { label: "Net"; value: root.liveValue("net"); active: root.selMetric === "net"; onChosen: { root.selMetric = "net"; if (root.rangeSummary) root.rangeSummary = root.buildRangeSummary(root.rangeSummary.t1, root.rangeSummary.t2) } }
+          }
+
+          Row {
+            id: rangeRow
+            z: 90
+            visible: !root.compact
+            anchors.top: parent.top
+            anchors.right: parent.right
+            spacing: Style.space(8)
+
+            RangePill { seconds: 900; active: root.chartWindow === 900; onChosen: root.chartWindow = 900 }
+            RangePill { seconds: 3600; active: root.chartWindow === 3600; onChosen: root.chartWindow = 3600 }
+            RangePill { seconds: 21600; active: root.chartWindow === 21600; onChosen: root.chartWindow = 21600 }
+            RangePill { seconds: 86400; active: root.chartWindow === 86400; onChosen: root.chartWindow = 86400 }
+          }
+
+          Text {
+            id: homeHint
+            visible: !root.compact
+            anchors.top: metricRow.bottom
+            anchors.topMargin: Style.space(6)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            text: "drag a range to see what used it (popup, ranked by the selected pill) · wheel to zoom · drag when zoomed to pan · double-click reset · click a point for that moment's processes"
+            color: root.dim2
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+
+          HistoryGraph {
+            id: graph
+            anchors.top: root.compact ? parent.top : homeHint.bottom
+            anchors.topMargin: root.compact ? 0 : Style.space(8)
+            // Flexible: the chart takes whatever height the fixed-size strips and
+            // the fixed-height process list below it leave over. Anchored to
+            // tempStrip.top, which is itself anchored downward, so the chain is
+            // one-directional and cannot form an anchor loop.
+            anchors.bottom: root.compact ? parent.bottom : tempStrip.top
+            anchors.bottomMargin: root.compact ? 0 : Style.space(4)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            pts: root.chartPts
+            lineColor: root.accent
+            events: root.chartEvents
+            dangerColor: root.urgent
+            dangerThreshold: (root.selMetric === "procs" || root.selMetric === "net" || root.selMetric === "disk") ? -1 : 90
+            maxValue: (root.selMetric === "procs" || root.selMetric === "net" || root.selMetric === "disk") ? -1 : 100
+            unit: root.chartUnit
+            windowSecs: root.chartWindow
+            onDrilled: function(ts) {
+              // Clicking near an event pin opens the full event-detail popup;
+              // anywhere else keeps the process drill-down.
+              var evs = root.chartEvents
+              var best = null, bd = 60
+              for (var i = 0; i < evs.length; i++) {
+                var dd = Math.abs(evs[i].ts - ts)
+                if (dd < bd) { bd = dd; best = evs[i] }
+              }
+              if (best) { root.eventDetail = best; return }
+              root.drillTs = ts
+              root.drillProcs = root.topAt(ts, 20)
+              if (!root.drillProcs.length) root.drillProcs = null
+              if (root.compact) root.compact = false
+            }
+            onRangeSelected: function(t1, t2) {
+              root.showRangePopup(t1, t2)
+            }
+          }
+
+          TemperatureStrip {
+            id: tempStrip
+            visible: !root.compact
+            anchors.bottom: mini.top
+            anchors.bottomMargin: Style.space(6)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Style.space(24)
+            pts: root.tempSeriesFor(root.chartWindow)
+            domainStart: graph.domStart
+            domainEnd: graph.domEnd
+          }
+
+          MiniOverview {
+            id: mini
+            visible: !root.compact
+            anchors.bottom: pane.top
+            anchors.bottomMargin: Style.space(8)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Style.space(28)
+            pts: root.chartPts
+            graph: graph
+          }
+
+          Item {
+            id: pane
+            visible: !root.compact
+            // Fixed height: exactly `procRowsVisible` rows plus the header chrome.
+            // Anchored to the bottom of the column so the chart above absorbs the
+            // remaining vertical space.
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: root.paneH
+
+            Row {
+              id: paneHeader
+              z: 90
+              anchors.bottom: paneTitle.top
+              anchors.bottomMargin: Style.space(4)
+              anchors.left: parent.left
+              anchors.right: parent.right
+              spacing: Style.space(8)
+
+              Rectangle {
+                width: parent.width - (root.drillProcs !== null ? Style.space(112) : 0) - Style.space(166)
+                height: Style.space(30)
+                radius: Style.space(12)
+                color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.12)
+                border.width: 1
+                border.color: Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.4)
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "\uf002"
+                  color: root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                TextInput {
+                  id: searchInput
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(28)
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  color: root.fg
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  clip: true
+                  selectByMouse: true
+                  onTextChanged: root.search = text
+                }
+              }
+
+              OMCPill {
+                visible: root.drillProcs !== null
+                width: Style.space(104)
+                label: "\uf053  Live"
+                active: false
+                onChosen: root.drillProcs = null
+              }
+              SortMenu {
+                visible: root.drillProcs === null
+                options: root.sortOptions
+                value: root.procSort
+                onChosen: function(v) { root.procSort = v }
+              }
+            }
+
+            Text {
+              id: paneTitle
+              anchors.bottom: procHeader.top
+              anchors.bottomMargin: Style.space(6)
+              anchors.left: parent.left
+              anchors.right: parent.right
+              text: root.drillProcs
+                  ? (root.selMetric === "net"
+                      ? "Network usage at " + root.fmtTime(root.drillTs) + " · ranked by transfer · click the chart elsewhere to change the moment"
+                      : root.selMetric === "disk"
+                        ? "Disk I/O at " + root.fmtTime(root.drillTs) + " · ranked by I/O · click the chart elsewhere to change the moment"
+                        : "Processes at " + root.fmtTime(root.drillTs) + " · click the chart elsewhere to change the moment")
+                  : "Running processes · click a row for details & actions · NET column = live transfer per process"
+              color: root.dim1
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            ColHeader {
+              id: procHeader
+              anchors.bottom: procList.top
+              anchors.bottomMargin: Style.space(2)
+              anchors.left: parent.left
+              anchors.right: parent.right
+              leftLabel: "PROCESS"
+              midLabel: "TRUST"
+            }
+
+            ListView {
+              id: procList
+              anchors.bottom: parent.bottom
+              anchors.left: parent.left
+              anchors.right: parent.right
+              // Fixed to `procRowsVisible` rows — the list no longer stretches to
+              // fill leftover space, so it always shows a predictable number of
+              // processes and scrolls for the rest.
+              height: root.procListH
+              clip: true
+              spacing: root.procRowSpacing
+              model: root.drillProcs !== null ? root.drillProcs : root.filteredProcs
+              delegate: ProcRow {
+                width: procList.width
+                name: modelData.name
+                publisher: modelData.publisher || ""
+                desc: modelData.desc || ""
+                pid: Number(modelData.pid) || 0
+                cpu: modelData.cpu
+                mem: modelData.mem
+                io: modelData.io_kbs
+                gpu: modelData.gpu
+                net: (modelData.nr !== undefined || modelData.nt !== undefined)
+                    ? ((Number(modelData.nr) || 0) + (Number(modelData.nt) || 0)) : -1
+                verified: modelData.verified
+                perms: modelData.perms
+                instances: Number(modelData.instances) || 1
+                disabled: modelData.disabled
+                sparks: root.sparksFor(modelData.name)
+                onDetails: root.detailApp = ({ name: modelData.name,
+                  publisher: modelData.publisher, verified: modelData.verified,
+                  source: modelData.source, desc: modelData.desc || "",
+                  exe: modelData.exe || "", pkg: modelData.pkg || "",
+                  perms: modelData.perms || [], disabled: modelData.disabled,
+                  pids: root.pidsFor(modelData.name),
+                  cpu: modelData.cpu, mem: modelData.mem, instances: modelData.instances })
+                onKill: root.appAction("kill", modelData.name)
+                onDisable: root.disableApp(modelData.name)
+                onEnable: root.enableApp(modelData.name)
+              }
+            }
+          }
+
+          // ---- Dragged-range popup: aggregates the highlighted area for the
+          // selected pill (CPU → top CPU apps, MEM → top memory apps, Net →
+          // top transfer apps, etc.). Shown when the user drags a range on the
+          // history graph; rebuilt live if a pill is switched while open.
+          Item {
+            id: rangePopup
+            visible: root.rangeSummary !== null
+            anchors.fill: parent
+            z: 150
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: false
+              onClicked: root.rangeSummary = null
+            }
+
+            Shortcut {
+              sequence: "Escape"
+              onActivated: root.rangeSummary = null
+            }
+
+            Rectangle {
+              anchors.centerIn: parent
+              width: Math.min(parent.width - Style.space(48), Style.space(360))
+              implicitHeight: rpCol.implicitHeight + Style.space(20)
+              radius: Style.space(14)
+              color: root.surface
+              border.width: 1
+              border.color: root.surfaceBorder
+
+              Column {
+                id: rpCol
+                anchors.fill: parent
+                anchors.margins: Style.space(12)
+                spacing: Style.space(6)
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  Text {
+                    width: parent.width - Style.space(24)
+                    text: (root.rangeSummary ? root.rangeSummary.mlabel : "") + " in dragged range"
+                    color: root.fg
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    text: "\uf2d3"
+                    color: root.dim1
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.body
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.rangeSummary = null
+                    }
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  text: root.rangeSummary
+                      ? root.fmtTime(root.rangeSummary.t1) + " – " + root.fmtTime(root.rangeSummary.t2)
+                        + "   ·   " + root.rangeSummary.nsnap + " minute sample" + (root.rangeSummary.nsnap === 1 ? "" : "s")
+                      : ""
+                  color: root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  width: parent.width
+                  visible: root.rangeSummary
+                           && (root.rangeSummary.metric === "net" || root.rangeSummary.metric === "disk")
+                           && root.rangeSummary.nsnapData < root.rangeSummary.nsnap
+                  text: root.rangeSummary
+                      ? "· per-app " + (root.rangeSummary.metric === "net" ? "network" : "disk I/O")
+                        + " in " + root.rangeSummary.nsnapData + " of " + root.rangeSummary.nsnap + " minute sample"
+                        + (root.rangeSummary.nsnap === 1 ? "" : "s")
+                      : ""
+                  color: root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  width: parent.width
+                  visible: root.rangeSummary && root.rangeSummary.devPeak !== null
+                  text: root.rangeSummary
+                      ? ("Device peak " + root.fmtRangePeak(root.rangeSummary.metric, root.rangeSummary.devPeak)
+                         + (root.rangeSummary.peakAt ? " @ " + root.rangeSummary.peakAt + " · avg " + root.fmtRangeVal(root.rangeSummary.metric, root.rangeSummary.devAvg) : ""))
+                      : ""
+                  color: root.dim2
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Rectangle {
+                  width: parent.width
+                  height: 1
+                  color: root.surfaceBorder
+                  visible: root.rangeSummary && root.rangeSummary.rows.length > 0
+                }
+
+                Repeater {
+                  model: root.rangeSummary ? root.rangeSummary.rows : []
+                  delegate: Row {
+                    width: rpCol.width
+                    spacing: Style.space(8)
+
+                    Rectangle {
+                      width: Style.space(7)
+                      height: Style.space(7)
+                      anchors.verticalCenter: parent.verticalCenter
+                      radius: Style.space(2)
+                      color: root.accent
+                      opacity: 0.6 + 0.4 * (1 - index / Math.max(1, root.rangeSummary.rows.length))
+                    }
+
+                    Text {
+                      width: parent.width - Style.space(120)
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: modelData.pretty
+                      color: root.fg
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      width: Style.space(104)
+                      anchors.verticalCenter: parent.verticalCenter
+                      horizontalAlignment: Text.AlignRight
+                      text: root.rangeSummary
+                          ? (root.rangeSummary.metric === "net"
+                              ? Model.fmtRateShort(modelData.srx) + "↓ " + Model.fmtRateShort(modelData.stx) + "↑"
+                              : root.fmtRangeVal(root.rangeSummary.metric, modelData.v))
+                          : ""
+                      color: root.dim1
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.Wrap
+                  visible: root.rangeSummary && root.rangeSummary.rows.length === 0
+                  text: root.rangeSummary
+                      ? (root.rangeSummary.nsnap === 0
+                          ? "No per-minute process samples cover this range (samples keep ~90 minutes). Zoomed/app-level listing starts applying as new minutes land."
+                          : root.rangeSummary.nsnapData === 0 && (root.rangeSummary.metric === "net" || root.rangeSummary.metric === "disk")
+                              ? "No per-app " + (root.rangeSummary.metric === "net" ? "network" : "disk I/O")
+                                + " data in these minutes yet (per-app collection only started recently)."
+                              : "No per-process data for this range.")
+                      : ""
+                  color: root.dim2
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  width: parent.width
+                  text: "Esc or click outside to close · switch a pill to re-ranked · drag again for a new range"
+                  color: root.dim2
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+        }
+
+        // ---- Apps page
+        Item {
+          visible: root.activeTab === 1
+          anchors.fill: parent
+          anchors.margins: Style.space(16)
+
+          Row {
+            z: 90
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: Style.space(8)
+
+            Rectangle {
+              width: parent.width - Style.space(516)
+              height: Style.space(30)
+              radius: Style.space(12)
+              color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.12)
+              border.width: 1
+              border.color: Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.4)
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: "\uf002"
+                color: root.dim1
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+              }
+              TextInput {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(28)
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                color: root.fg
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.body
+                clip: true
+                selectByMouse: true
+                onTextChanged: root.appSearch = text
+              }
+            }
+
+            SortMenu {
+              options: root.sortOptions
+              value: root.appSort
+              onChosen: function(v) { root.appSort = v }
+            }
+
+            OMCPill { label: "Running"; active: root.activityFilter === "running"; onChosen: root.activityFilter = "running" }
+            OMCPill { label: "Not running"; active: root.activityFilter === "not"; onChosen: root.activityFilter = "not" }
+            OMCPill { label: "All"; active: root.activityFilter === "all"; onChosen: root.activityFilter = "all" }
+            OMCPill { label: "Disabled"; active: root.showDisabledOnly; onChosen: root.showDisabledOnly = !root.showDisabledOnly }
+          }
+
+          Text {
+            id: appsTitle
+            anchors.top: parent.top
+            anchors.topMargin: Style.space(38)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            text: (root.filteredApps || []).length + " apps · click a row for details · NET column = system-wide transfer"
+            color: root.dim1
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+
+          ColHeader {
+            id: appHeader
+            anchors.top: appsTitle.bottom
+            anchors.topMargin: Style.space(6)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            leftLabel: "APP"
+            midLabel: "TRUST"
+          }
+
+          ListView {
+            id: appList
+            anchors.top: appHeader.bottom
+            anchors.topMargin: Style.space(2)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            clip: true
+            spacing: Style.space(4)
+            model: root.filteredApps
+            delegate: AppRow {
+              width: appList.width
+              app: modelData
+              onDetails: root.detailApp = modelData
+              onKill: root.appAction("kill", modelData.name)
+              onDisable: root.disableApp(modelData.name)
+              onEnable: root.enableApp(modelData.name)
+            }
+          }
+        }
+
+        // ---- Alerts page
+        Item {
+          visible: root.activeTab === 2
+          anchors.fill: parent
+          anchors.margins: Style.space(16)
+
+          Row {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: Style.space(8)
+            Text {
+              text: "\uf013  Alerts config"
+              color: root.fg
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              anchors.verticalCenter: parent.verticalCenter
+            }
+            Item { width: Style.space(10); height: 1 }
+            OMCPill {
+              label: root.alertPrefs.enabled ? "Alerts ON" : "Alerts OFF"
+              active: root.alertPrefs.enabled !== false
+              onChosen: {
+                var next = !root.alertPrefs.enabled
+                root.alertPrefs = ({ "enabled": next, "types": root.alertPrefs.types || {}, "charts": root.alertPrefs.charts || {} })
+                root.setAlertsEnabled(next)
+                root.refreshSoon()
+              }
+            }
+          }
+
+          Text {
+            id: alertsTitle
+            anchors.top: parent.top
+            anchors.topMargin: Style.space(44)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            text: "Per event type, pick how it surfaces — Toast · Notify me · Quiet — and whether it leaves a marker on the history chart"
+            color: root.dim1
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            lineHeight: 1.3
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            id: alertsHelp
+            anchors.top: alertsTitle.bottom
+            anchors.topMargin: Style.space(8)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            text: "Each type gets one notification mode below; the Chart marker switch is independent of it. The Alerts ON/OFF pill above silences everything at once."
+            color: root.dim2
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            lineHeight: 1.3
+            wrapMode: Text.WordWrap
+          }
+
+          Row {
+            anchors.top: alertsHelp.bottom
+            anchors.topMargin: Style.space(14)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            spacing: Style.space(8)
+
+            Column {
+              width: (parent.width - Style.space(24)) / 4
+              spacing: Style.space(6)
+              Rectangle {
+                width: parent.width; height: Style.space(30); radius: Style.space(12)
+                color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+                border.width: 1
+                border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.4)
+                Text {
+                  anchors.left: parent.left; anchors.leftMargin: Style.space(10); anchors.verticalCenter: parent.verticalCenter
+                  text: "Toast"
+                  color: root.accent
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+              }
+              Text {
+                width: parent.width
+                height: Style.space(34)
+                text: "Instant desktop pop-up, plus a count dot on the Events tab."
+                color: root.dim2
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                lineHeight: 1.3
+                wrapMode: Text.WordWrap
+              }
+              Repeater {
+                model: root.alertTypes
+                delegate: OMCPill {
+                  width: parent.width
+                  active: root.alertMode(modelData) === "toast"
+                  label: modelData
+                  onChosen: root.setAlertMode(modelData, "toast")
+                }
+              }
+            }
+
+            Column {
+              width: (parent.width - Style.space(24)) / 4
+              spacing: Style.space(6)
+              Rectangle {
+                width: parent.width; height: Style.space(30); radius: Style.space(12)
+                color: Qt.rgba(root.warn.r, root.warn.g, root.warn.b, 0.10)
+                border.width: 1
+                border.color: Qt.rgba(root.warn.r, root.warn.g, root.warn.b, 0.45)
+                Text {
+                  anchors.left: parent.left; anchors.leftMargin: Style.space(10); anchors.verticalCenter: parent.verticalCenter
+                  text: "Notify me"
+                  color: root.warn
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+              }
+              Text {
+                width: parent.width
+                height: Style.space(34)
+                text: "No pop-up; adds a red count dot on the Events (bell) tab to check later."
+                color: root.dim2
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                lineHeight: 1.3
+                wrapMode: Text.WordWrap
+              }
+              Repeater {
+                model: root.alertTypes
+                delegate: OMCPill {
+                  width: parent.width
+                  active: root.alertMode(modelData) === "notify"
+                  label: modelData
+                  onChosen: root.setAlertMode(modelData, "notify")
+                }
+              }
+            }
+
+            Column {
+              width: (parent.width - Style.space(24)) / 4
+              spacing: Style.space(6)
+              Rectangle {
+                width: parent.width; height: Style.space(30); radius: Style.space(12)
+                color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.10)
+                border.width: 1
+                border.color: Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.25)
+                Text {
+                  anchors.left: parent.left; anchors.leftMargin: Style.space(10); anchors.verticalCenter: parent.verticalCenter
+                  text: "No notification"
+                  color: root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+              }
+              Text {
+                width: parent.width
+                height: Style.space(34)
+                text: "No pop-up or badge — the event is only logged for later."
+                color: root.dim2
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                lineHeight: 1.3
+                wrapMode: Text.WordWrap
+              }
+              Repeater {
+                model: root.alertTypes
+                delegate: OMCPill {
+                  width: parent.width
+                  active: root.alertMode(modelData) === "none"
+                  label: modelData
+                  onChosen: root.setAlertMode(modelData, "none")
+                }
+              }
+            }
+
+            Column {
+              width: (parent.width - Style.space(24)) / 4
+              spacing: Style.space(6)
+              Rectangle {
+                width: parent.width; height: Style.space(30); radius: Style.space(12)
+                color: Qt.rgba(root.info.r, root.info.g, root.info.b, 0.10)
+                border.width: 1
+                border.color: Qt.rgba(root.info.r, root.info.g, root.info.b, 0.45)
+                Text {
+                  anchors.left: parent.left; anchors.leftMargin: Style.space(10); anchors.verticalCenter: parent.verticalCenter
+                  text: "Chart marker"
+                  color: root.info
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+              }
+              Text {
+                width: parent.width
+                height: Style.space(34)
+                text: "Pin on the history chart to spot patterns — independent of the modes above."
+                color: root.dim2
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                lineHeight: 1.3
+                wrapMode: Text.WordWrap
+              }
+              Repeater {
+                model: root.alertTypes
+                delegate: OMCPill {
+                  width: parent.width
+                  active: root.chartShown(modelData)
+                  label: root.chartShown(modelData) ? modelData : (modelData + " · hidden")
+                  onChosen: root.setChartToggle(modelData, !root.chartShown(modelData))
+                }
+              }
+            }
+          }
+
+          Text {
+            visible: false
+            anchors.fill: parent
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            text: "Toggle the global switch to stop all alerts.\nOpen the Events tab to see what you would have been notified about."
+            color: root.dim2
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+            lineHeight: 1.4
+          }
+        }
+
+        // ---- Events page
+        Item {
+          visible: root.activeTab === 3
+          anchors.fill: parent
+          anchors.margins: Style.space(16)
+
+          Row {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: Style.space(8)
+            OMCPill { label: "All"; active: root.eventFilter === "all"; onChosen: root.eventFilter = "all" }
+            OMCPill { label: "Launches"; active: root.eventFilter === "new_app"; onChosen: root.eventFilter = "new_app" }
+            OMCPill { label: "Exits"; active: root.eventFilter === "exit"; onChosen: root.eventFilter = "exit" }
+            OMCPill { label: "Spikes"; active: root.eventFilter === "spike"; onChosen: root.eventFilter = "spike" }
+            OMCPill { label: "Permissions"; active: root.eventFilter === "permission"; onChosen: root.eventFilter = "permission" }
+            OMCPill { label: "Security"; active: root.eventFilter === "security"; onChosen: root.eventFilter = "security" }
+            OMCPill { label: "User"; active: root.eventFilter === "user"; onChosen: root.eventFilter = "user" }
+            Item { width: Style.space(6); height: 1 }
+            OMCPill {
+              visible: root.eventBadge > 0
+              width: Style.space(112)
+              label: "\uf053  Mark all read"
+              active: true
+              onChosen: { root.markAllEventsRead(); root.eventBadge = 0; root.computeEvents() }
+            }
+            OMCPill {
+              width: Style.space(84)
+              label: "\uf00d  Clear"
+              active: false
+              onChosen: { root.clearEvents() }
+            }
+          }
+
+          Rectangle {
+            id: eventSearchBar
+            anchors.top: parent.top
+            anchors.topMargin: Style.space(38)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Style.space(26)
+            radius: Style.space(12)
+            color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.12)
+            border.width: 1
+            border.color: Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.4)
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "\uf002"
+              color: root.dim1
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+            TextInput {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(28)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              color: root.fg
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              clip: true
+              selectByMouse: true
+              onTextChanged: root.eventSearch = text
+            }
+          }
+
+          Text {
+            id: eventsTitle
+            anchors.top: eventSearchBar.bottom
+            anchors.topMargin: Style.space(4)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            text: "Persistent history · click any row for full details and actions"
+            color: root.dim1
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+
+          ListView {
+            id: eventList
+            anchors.top: eventsTitle.bottom
+            anchors.topMargin: Style.space(6)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            clip: true
+            spacing: Style.space(4)
+            model: root.filteredEvents
+            delegate: EventRow {
+              width: eventList.width
+              event: modelData
+              onMarkRead: function(id) { root.markEventRead(id) }
+              onKill: function(name) { root.appAction("kill", name) }
+              onDisable: function(name) { root.disableApp(name) }
+              onEnable: function(name) { root.enableApp(name) }
+              onDetails: function(ev) {
+                root.eventDetail = ev
+                if (!ev.read) root.markEventRead(ev.id)
+              }
+            }
+          }
+
+          Text {
+            anchors.fill: eventList
+            visible: (root.filteredEvents || []).length === 0
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            text: "\uf0c3\n\nNo events match — try a different filter or clear the search"
+            color: root.dim2
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+            lineHeight: 1.4
+          }
+        }
+
+        // ---- Settings page (bar icon stats)
+        Item {
+          visible: root.activeTab === 4
+          anchors.fill: parent
+          anchors.margins: Style.space(16)
+
+          Flickable {
+            id: settingsFlick
+            anchors.fill: parent
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            contentHeight: settingsCol.implicitHeight
+            interactive: settingsCol.implicitHeight > settingsFlick.height
+
+            Column {
+              id: settingsCol
+              width: settingsFlick.width
+              spacing: Style.space(10)
+
+            PanelSectionHeader {
+              text: "BAR ICON STATS"
+              foreground: root.fg
+              fontFamily: root.contentFontFamily
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "Choose which stats appear in the OmaControl bar icon. Selection order matches the bar label order."
+              color: root.dim1
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              spacing: Style.space(6)
+              Text {
+                text: "Show as:"
+                color: root.dim1
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              ButtonGroup {
+                id: barModeGroup
+                anchors.verticalCenter: parent.verticalCenter
+                options: [
+                  { value: "name", label: "Name" },
+                  { value: "none", label: "None" }
+                ]
+                value: root.barPrefs.mode === "none" ? "none" : "name"
+                foreground: root.fg
+                background: root.surface
+                accent: root.accent
+                fontFamily: root.contentFontFamily
+                onChanged: function(v) { root.setBarPrefMode(v) }
+              }
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Style.space(36)
+              radius: Style.space(12)
+              color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.07)
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.space(8)
+                spacing: Style.space(8)
+                Text {
+                  text: "Preview:"
+                  color: root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  text: "\uf0c8  " + root.barPrefPreview()
+                  color: root.accent
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  anchors.verticalCenter: parent.verticalCenter
+                  elide: Text.ElideRight
+                }
+              }
+            }
+
+            Flow {
+              width: parent.width
+              spacing: Style.space(6)
+              Repeater {
+                model: Model.barStatsCatalog()
+                delegate: Item {
+                  width: (parent.width - Style.space(6)) / 2
+                  height: Style.space(30)
+                  Rectangle {
+                    anchors.fill: parent
+                    radius: Style.space(12)
+                    color: tileHover.containsMouse || root.isBarPref(modelData.id)
+                        ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.12)
+                        : "transparent"
+                    border.color: root.isBarPref(modelData.id) ? root.accent : root.dim1
+                    border.width: 1
+                  }
+                  Row {
+                    anchors.fill: parent
+                    anchors.margins: Style.space(6)
+                    spacing: Style.space(8)
+                    Text {
+                      text: root.isBarPref(modelData.id) ? "\uf14a" : "\uf0c8"
+                      color: root.isBarPref(modelData.id) ? root.accent : root.dim1
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Text {
+                      text: modelData.label
+                      color: root.dim1
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                      elide: Text.ElideRight
+                      width: parent.width - Style.space(26)
+                    }
+                  }
+                  MouseArea {
+                    id: tileHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.toggleBarPref(modelData.id)
+                  }
+                }
+              }
+            }
+
+            Row {
+              spacing: Style.space(6)
+              Rectangle {
+                width: resetText.implicitWidth + Style.space(20)
+                height: Style.space(28); radius: Style.space(12)
+                border.width: 1
+                border.color: root.urgent
+                color: resetPrefsArea.containsMouse ? root.urgent : "transparent"
+                Text {
+                  id: resetText
+                  anchors.centerIn: parent
+                  text: "Reset to default"
+                  color: resetPrefsArea.containsMouse ? root.bg : root.urgent
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+                MouseArea {
+                  id: resetPrefsArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.resetBarPrefs()
+                }
+              }
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Style.space(42)
+              radius: Style.space(12)
+              color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.07)
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.space(8)
+                spacing: Style.space(8)
+                Text {
+                  text: "\uf0f3"
+                  color: root.barPrefs.barShowBell !== false ? root.accent : root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  width: parent.width - Style.space(70)
+                  elide: Text.ElideRight
+                  text: "Show unread bell badge in the top bar"
+                  color: root.fg
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Rectangle {
+                  width: Style.space(46); height: Style.space(22); radius: Style.space(11)
+                  border.width: 1
+                  border.color: root.barPrefs.barShowBell !== false ? root.accent : root.dim1
+                  color: (bellHover.containsMouse || root.barPrefs.barShowBell !== false) ? root.accentSoft : "transparent"
+                  Text {
+                    anchors.centerIn: parent
+                    text: root.barPrefs.barShowBell !== false ? "ON" : "OFF"
+                    color: root.barPrefs.barShowBell !== false ? root.accent : root.dim1
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                  MouseArea {
+                    id: bellHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.setBarShowBell(root.barPrefs.barShowBell === false)
+                  }
+                }
+              }
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Style.space(42)
+              radius: Style.space(12)
+              color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.07)
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.space(8)
+                spacing: Style.space(8)
+                Text {
+                  text: "\uf0ac"
+                  color: root.perProcNet ? root.accent : root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  width: parent.width - Style.space(70)
+                  elide: Text.ElideRight
+                  text: "Per-process network attribution in charts"
+                  color: root.fg
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Rectangle {
+                  width: Style.space(46); height: Style.space(22); radius: Style.space(11)
+                  border.width: 1
+                  border.color: root.perProcNet ? root.accent : root.dim1
+                  color: (netHover.containsMouse || root.perProcNet) ? root.accentSoft : "transparent"
+                  Text {
+                    anchors.centerIn: parent
+                    text: root.perProcNet ? "ON" : "OFF"
+                    color: root.perProcNet ? root.accent : root.dim1
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                  MouseArea {
+                    id: netHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.setPerProcNet(!root.perProcNet)
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              text: "Saved to barstats.json — the bar icon updates automatically. Stats with no live value are hidden."
+              color: root.dim2
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            // ---- Alert sensitivity: profile + resolved thresholds, shared
+            // with the collector (sustained alerts) and the bar bell.
+            PanelSeparator {
+              width: parent.width
+              foreground: root.fg
+            }
+
+            PanelSectionHeader {
+              text: "ALERT SENSITIVITY"
+              foreground: root.fg
+              fontFamily: root.contentFontFamily
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "A profile sets every resource alert threshold at once (CPU, memory, GPU, temperatures, runaway processes, hysteresis window). Fine-tune any value from the CLI: omcontrol alert-prefs set-threshold <metric> <value>."
+              color: root.dim1
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              spacing: Style.space(6)
+              component SensPill: Rectangle {
+                id: spp
+                property bool active: false
+                property string label: ""
+                property var action: null
+                width: sensPillText.implicitWidth + Style.space(20)
+                height: Style.space(28)
+                radius: Style.space(12)
+                border.width: 1
+                border.color: spp.active ? root.accent : root.dim1
+                color: (sensPillArea.containsMouse || spp.active) ? root.accentSoft : "transparent"
+                Text {
+                  id: sensPillText
+                  anchors.centerIn: parent
+                  text: spp.label
+                  color: spp.active ? root.accent : root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+                MouseArea {
+                  id: sensPillArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: if (spp.action) spp.action()
+                }
+              }
+              SensPill { label: "Mild"; active: root.alertProfile === "mild"; action: function() { root.setAlertProfile("mild") } }
+              SensPill { label: "Medium"; active: root.alertProfile === "medium"; action: function() { root.setAlertProfile("medium") } }
+              SensPill { label: "Severe"; active: root.alertProfile === "severe"; action: function() { root.setAlertProfile("severe") } }
+            }
+
+            Flow {
+              visible: Object.keys(root.alertThresholds).length > 0
+              width: parent.width
+              spacing: Style.space(6)
+              Repeater {
+                model: ["cpu_pct", "mem_pct", "gpu_pct", "cpu_temp", "gpu_temp", "proc_cpu_pct", "proc_mem_pct", "hold"]
+                delegate: Rectangle {
+                  width: chipText.implicitWidth + Style.space(14)
+                  height: Style.space(24)
+                  radius: Style.space(12)
+                  color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.07)
+                  Text {
+                    id: chipText
+                    anchors.centerIn: parent
+                    text: modelData + " " + String(root.alertThresholds[modelData] != null
+                        ? Math.round(root.alertThresholds[modelData]) : "--")
+                    color: root.dim1
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
+
+            // ---- Support / Buy Me a Coffee (same pattern as the mouse &
+            // keybind settings plugin; hidden via the toggle below).
+            PanelSeparator {
+              width: parent.width
+              foreground: root.fg
+            }
+
+            PanelSectionHeader {
+              text: "SUPPORT"
+              foreground: root.fg
+              fontFamily: root.contentFontFamily
+            }
+
+            Rectangle {
+              visible: root.barPrefs.showBuyButton !== false
+              width: parent.width
+              height: Style.space(50)
+              radius: Style.space(12)
+              color: donateRowHover.containsMouse ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.14) : Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.07)
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.space(8)
+                spacing: Style.space(8)
+                Image {
+                  id: kofiImage
+                  visible: kofiImage.status !== Image.Error
+                  width: 143
+                  height: 36
+                  anchors.verticalCenter: parent.verticalCenter
+                  sourceSize.height: 72
+                  fillMode: Image.PreserveAspectFit
+                  smooth: true
+                  mipmap: true
+                  source: "https://storage.ko-fi.com/cdn/kofi5.png?v=6"
+                }
+                Rectangle {
+                  visible: kofiImage.status === Image.Error || kofiImage.status === Image.Null || kofiImage.status === Image.Loading
+                  width: 143
+                  height: 36
+                  radius: Style.space(12)
+                  color: "transparent"
+                  border.width: 1
+                  border.color: root.dim1
+                  Text {
+                    anchors.centerIn: parent
+                    text: "☕ Buy Me a Coffee"
+                    color: "#FF813F"
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                }
+                Text {
+                  width: parent.width - Style.space(180)
+                  elide: Text.ElideRight
+                  text: "Donate a coffee to support OmaControl"
+                  color: root.fg
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+              MouseArea {
+                id: donateRowHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openBuyMeACoffee()
+              }
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Style.space(42)
+              radius: Style.space(12)
+              color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.07)
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.space(8)
+                spacing: Style.space(8)
+                Text {
+                  text: "\uf7b6"
+                  color: root.barPrefs.showBuyButton !== false ? root.accent : root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  width: parent.width - Style.space(70)
+                  elide: Text.ElideRight
+                  text: "Show the Buy Me a Coffee button"
+                  color: root.fg
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Rectangle {
+                  width: Style.space(46); height: Style.space(22); radius: Style.space(11)
+                  border.width: 1
+                  border.color: root.barPrefs.showBuyButton !== false ? root.accent : root.dim1
+                  color: (buyCoffeeHover.containsMouse || root.barPrefs.showBuyButton !== false) ? root.accentSoft : "transparent"
+                  Text {
+                    anchors.centerIn: parent
+                    text: root.barPrefs.showBuyButton !== false ? "ON" : "OFF"
+                    color: root.barPrefs.showBuyButton !== false ? root.accent : root.dim1
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                  MouseArea {
+                    id: buyCoffeeHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.setShowBuyButton(root.barPrefs.showBuyButton === false)
+                  }
+                }
+              }
+            }
+            }
+          }
+        }
+      }
+
+      PanelSeparator {
+        Layout.fillWidth: true
+        Layout.preferredHeight: 1
+        foreground: root.fg
+      }
+
+      // ==================== Bottom nav
+      Item {
+        Layout.fillWidth: true
+        // Compact previously forced this to 0, which collapsed the row but left
+        // its children laid out — so the tabs overflowed and drew straight on
+        // top of the chart (visible in the compact screenshot as icons sitting
+        // over the x-axis labels). Give the row a real compact height so the
+        // rail occupies its own band at the bottom of the card.
+        Layout.preferredHeight: root.compact ? Style.space(46) : Style.space(84)
+        Rectangle {
+          anchors.fill: parent
+          color: "transparent"
+        }
+        // Fixed-width tabs in a centred group. Previously each tab took a fifth
+        // of the whole 1100px card, which left ~180px of dead space between a
+        // ~40px pill and made the rail read as scattered dots.
+        Row {
+          anchors.centerIn: parent
+          spacing: Style.space(root.compact ? 10 : 6)
+          NavTab { width: Style.space(root.compact ? 44 : 112); height: Style.space(root.compact ? 40 : 60); iconOnly: root.compact; iconText: "\uf201"; label: "Activity"; active: root.activeTab === 0; onChosen: root.activeTab = 0 }
+          NavTab { width: Style.space(root.compact ? 44 : 112); height: Style.space(root.compact ? 40 : 60); iconOnly: root.compact; iconText: "\uf00a"; label: "Apps"; active: root.activeTab === 1; onChosen: root.activeTab = 1 }
+          NavTab { width: Style.space(root.compact ? 44 : 112); height: Style.space(root.compact ? 40 : 60); iconOnly: root.compact; iconText: "\uf0f3"; label: "Alerts"; badge: root.alertBadge > 0 ? root.alertBadge : -1; active: root.activeTab === 2; onChosen: root.activeTab = 2 }
+          NavTab { width: Style.space(root.compact ? 44 : 112); height: Style.space(root.compact ? 40 : 60); iconOnly: root.compact; iconText: "\uf017"; label: "Events"; badge: root.eventBadge > 0 ? root.eventBadge : -1; active: root.activeTab === 3; onChosen: root.activeTab = 3 }
+          NavTab { width: Style.space(root.compact ? 44 : 112); height: Style.space(root.compact ? 40 : 60); iconOnly: root.compact; iconText: "\uf013"; label: "Settings"; active: root.activeTab === 4; onChosen: root.activeTab = 4 }
+        }
+      }
+    }
+  }
+
+  // ==================== App Details side panel + Disable confirm (overlays on the card)
+  DetailsPanel {
+    id: detailsPanel
+    visible: root.detailApp != null
+    app: root.detailApp
+    stats: root.detailStats
+    statsBusy: root.detailStatsBusy
+    netInfo: root.detailNet
+    netBusy: root.detailNetBusy
+    z: 60
+    // Content-sized rather than stretched top-to-bottom: anchoring both edges
+    // left a large dead gap above the buttons whenever the content was shorter
+    // than the card (which is most of the time). Now the panel grows to fit its
+    // content and is capped by maxPanelHeight; it only scrolls when it hits
+    // that cap.
+    anchors.top: card.top
+    anchors.topMargin: (root.compact ? Style.space(48) : Style.space(64)) + Style.space(16)
+    anchors.left: card.left
+    anchors.leftMargin: Style.space(16)
+    width: Style.space(430)
+    maxPanelHeight: card.height - Style.space(64) - Style.space(84) - Style.space(32)
+    onClose: root.detailApp = null
+    onKill: function(name) { root.appAction("kill", name); root.detailApp = null }
+    onDisable: function(name) { root.confirmedDisable(name) }
+    onEnable: function(name) { root.enableApp(name) }
+  }
+
+  ConfirmBar {
+    id: confirmBar
+    z: 61
+    anchors.left: card.left
+    anchors.leftMargin: Style.space(16)
+    anchors.right: card.right
+    anchors.rightMargin: Style.space(16)
+    anchors.bottom: card.bottom
+    anchors.bottomMargin: root.compact ? Style.space(8) : Style.space(84)
+    onYes: function(name) {
+      root.appAction("disable", name)
+      root.detailApp = null
+    }
+    onNo: {}
+  }
+
+  // ==================== Event details modal (one click from an Events row)
+  EventDetailPanel {
+    id: eventDetailPanel
+    visible: root.eventDetail != null
+    event: root.eventDetail
+    z: 63
+    anchors.fill: card
+    onEventChanged: {
+      if (root.eventDetail) root.loadEventContext(root.eventDetail)
+      else root.eventCtx = null
+    }
+    onClose: root.eventDetail = null
+    onKill: function(name) { root.appAction("kill", name); root.eventDetail = null }
+    onDisable: function(name) { root.disableApp(name); root.eventDetail = null }
+    onEnable: function(name) { root.enableApp(name); root.eventDetail = null }
+  }
+
+  // Shared rounded-pill: used by the Activity MET selectors (label + optional
+  // live value), the Apps filter row and the Alerts config chips — one shape
+  // everywhere. A BorderSurface so the border tracks the theme, with hover
+  // feedback and a luminance-aware label color (white only when the fill is
+  // actually dark, so a light accent on a light theme stays legible).
+  component OMCPill: BorderSurface {
+    id: pill
+    property bool active: false
+    property string label: ""
+    property string value: ""
+    property color pillColor: root.accent
+    property bool hovered: false
+    signal chosen()
+    radius: height / 2
+    // Uniform height now that the hero sizing is gone.
+    height: pill.value === "" ? Style.space(32) : Style.space(46)
+    width: pill.value === ""
+        ? Math.max(pillLabel.implicitWidth + Style.space(20), Style.space(40))
+        : Math.max(Style.space(116),
+                   Math.min(Style.space(170),
+                            pillValue.implicitWidth + Style.space(24)))
+    // AppControl behaviour: a filled pill marks the selection, everything else is
+    // bare text with no fill and no border. Only hover earns a faint tint.
+    color: pill.active
+        ? pill.pillColor
+        : (pill.hovered
+            ? Qt.rgba(pill.pillColor.r, pill.pillColor.g, pill.pillColor.b, 0.16)
+            : "transparent")
+    borderSpec: pill.active
+        ? Border.flat(pill.pillColor, 1)
+        : Border.none()
+    Text {
+      id: pillLabel
+      visible: pill.value === ""
+      anchors.centerIn: parent
+      text: pill.label
+      color: pill.active ? root.onColor(pill.pillColor) : (pill.hovered ? root.fg : root.dim1)
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.subtitle
+    }
+    Column {
+      visible: pill.value !== ""
+      anchors.centerIn: parent
+      spacing: 1
+      Text {
+        anchors.horizontalCenter: parent.horizontalCenter
+        text: pill.label
+        color: pill.active ? root.onColor(pill.pillColor) : (pill.hovered ? root.fg : root.dim1)
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Text {
+        id: pillValue
+        anchors.horizontalCenter: parent.horizontalCenter
+        text: pill.value
+        color: pill.active ? root.onColor(pill.pillColor) : root.fg
+        font.family: root.contentFontFamily
+        // Uniform value size. The oversized "hero number" was retired in favour
+        // of AppControl's flat, even metric tabs; the live figure is still one
+        // hover away on the graph tooltip.
+        font.pixelSize: Style.font.subtitle
+        font.bold: true
+        elide: Text.ElideRight
+        width: pill.width - Style.space(16)
+        horizontalAlignment: Text.AlignHCenter
+      }
+    }
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: pill.hovered = true
+      onExited: pill.hovered = false
+      onClicked: pill.chosen()
+    }
+  }
+
+  component RangePill: OMCPill {
+    id: rp
+    property int seconds: 3600
+    label: rp.seconds >= 86400 ? "1d"
+         : rp.seconds >= 21600 ? "6h"
+         : rp.seconds >= 3600 ? "1h"
+         : "15m"
+  }
+
+  // Sort dropdown for the Activity / Apps lists. Options: [{v, label}].
+  // Purely visual — the caller binds `value` and re-renders on change.
+  component SortMenu: Item {
+    id: sm
+    property var options: []
+    property string value: ""
+    property bool open: false
+    property string prefix: "Sort"
+    property bool hot: false
+    signal chosen(var v)
+    width: Style.space(158)
+    height: Style.space(30)
+    z: 60
+
+    readonly property string cur: (function() {
+      for (var i = 0; i < sm.options.length; i++)
+        if ((sm.options[i].v || "") === sm.value) return sm.options[i].label
+      return ""
+    })()
+
+    BorderSurface {
+      id: smBtn
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, sm.hot ? 0.2 : 0.12)
+      borderSpec: sm.open
+          ? Border.flat(root.accent, Style.selectedBorderWidth > 0 ? 1 : Style.hoverBorderWidth)
+          : Border.flat(Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, sm.hot ? 0.6 : 0.4), 1)
+      Text {
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(10)
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(18)
+        anchors.verticalCenter: parent.verticalCenter
+        text: sm.prefix + " \u25bc  " + sm.cur
+        color: root.fg
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+      MouseArea {
+        id: smArea
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onEntered: sm.hot = true
+        onExited: sm.hot = false
+        onClicked: sm.open = !sm.open
+      }
+    }
+
+    BorderSurface {
+      visible: sm.open
+      anchors.top: smBtn.bottom
+      anchors.topMargin: Style.space(4)
+      anchors.right: parent.right
+      z: 80
+      width: Style.space(182)
+      height: smContent.implicitHeight + Style.space(8)
+      color: root.surface
+      radius: Style.cornerRadius
+      borderSpec: root.cardBorderSpec
+      MouseArea {
+        anchors.fill: parent
+        onClicked: sm.open = false
+      }
+
+      Column {
+        id: smContent
+        anchors.top: parent.top
+        anchors.topMargin: Style.space(4)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        spacing: Style.space(2)
+        Repeater {
+          model: sm.options
+          delegate: Rectangle {
+            id: smOpt
+            width: parent.width
+            height: Style.space(26)
+            radius: Style.cornerRadius
+            color: modelData.v === sm.value
+                ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
+                : (smOptArea.containsMouse
+                    ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.12)
+                    : "transparent")
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: modelData.label
+              color: modelData.v === sm.value ? root.accent : root.fg
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+            MouseArea {
+              id: smOptArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                sm.chosen(modelData.v)
+                sm.open = false
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  component NavTab: Rectangle {
+    id: nt
+    property string iconText: ""
+    property string label: ""
+    property int badge: -1
+    property bool active: false
+    // Compact mode drops the text label and renders a square icon-only target,
+    // because five 112px labelled tabs are ~590px wide and ~52px tall, which
+    // cannot fit inside the 170px-tall compact card without pushing the chart
+    // out. Icon-only keeps the rail to ~40px so it sits under the chart.
+    property bool iconOnly: false
+    signal chosen()
+    color: "transparent"
+    property bool hovered: false
+    // Every tab is the same size and every pill is the same size, so the rail
+    // reads as one uniform unit. Previously the pill hugged the label, so
+    // "Activity" got a wide pill and "Apps" a narrow one.
+    readonly property real pillW: nt.iconOnly ? Style.space(44) : Style.space(112)
+    readonly property real pillH: nt.iconOnly ? Style.space(40) : Style.space(52)
+
+    Item {
+      id: ntBody
+      anchors.centerIn: parent
+      width: nt.pillW
+      height: nt.pillH
+
+      // Filled pill behind the icon + label for the active tab; a lighter
+      // hover-cursor tint takes over when the tab is not the current one.
+      Rectangle {
+        visible: nt.active || nt.hovered
+        anchors.fill: parent
+        radius: height / 2
+        color: nt.active
+            ? root.accentSoft
+            : Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.12)
+        Behavior on color { ColorAnimation { duration: 60 } }
+      }
+
+      Text {
+        id: ntIcon
+        anchors.horizontalCenter: parent.horizontalCenter
+        // Icon-only: centre in the pill. Labelled: sit at the top above the
+        // label. Switching anchor modes here (rather than just hiding the text)
+        // keeps the icon optically centred instead of leaving it pinned high.
+        anchors.verticalCenter: nt.iconOnly ? parent.verticalCenter : undefined
+        anchors.top: nt.iconOnly ? undefined : parent.top
+        anchors.topMargin: Style.space(9)
+        text: nt.iconText
+        color: nt.active ? root.accent : (nt.hovered ? root.fg : root.dim1)
+        font.family: root.contentFontFamily
+        font.pixelSize: nt.iconOnly ? Style.font.subtitle : Style.font.heading
+      }
+
+      Rectangle {
+        visible: nt.badge >= 0
+        width: Style.space(18)
+        height: Style.space(18)
+        radius: width / 2
+        color: root.urgent
+        anchors.left: ntIcon.right
+        anchors.leftMargin: Style.space(2)
+        anchors.top: ntIcon.top
+        anchors.topMargin: -Style.space(2)
+        Text {
+          anchors.centerIn: parent
+          text: nt.badge
+          color: root.onColor(root.urgent)
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+      }
+
+      Text {
+        id: ntLabel
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Style.space(8)
+        width: parent.width
+        horizontalAlignment: Text.AlignHCenter
+        visible: !nt.iconOnly
+        text: nt.label
+        color: nt.active ? root.accent : (nt.hovered ? root.dim1 : root.dim2)
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.body
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: nt.hovered = true
+      onExited: nt.hovered = false
+      onClicked: nt.chosen()
+    }
+  }
+
+  component ActionChip: Item {
+    id: chip
+    property string label: ""
+    property bool danger: false
+    property bool hovered: false
+    signal chosen()
+    width: Style.space(16) + chipText.implicitWidth
+    height: Style.space(22)
+    BorderSurface {
+      anchors.fill: parent
+      radius: height / 2
+      color: chip.danger
+          ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, chip.hovered ? 0.24 : 0.14)
+          : Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, chip.hovered ? 0.2 : 0.12)
+      borderSpec: chip.danger
+          ? Border.flat(Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, chip.hovered ? 0.7 : 0.4), 1)
+          : Border.flat(Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, chip.hovered ? 0.45 : 0.25), 1)
+    }
+    Text {
+      id: chipText
+      anchors.centerIn: parent
+      text: chip.label
+      color: chip.danger ? root.urgent : root.fg
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: chip.hovered = true
+      onExited: chip.hovered = false
+      onClicked: chip.chosen()
+    }
+  }
+
+  component AppRow: Item {
+    id: ar
+    property var app: ({})
+    property bool actionsOpen: false
+    property bool hovered: false
+    signal kill(string name)
+    signal enable(string name)
+    signal disable(string name)
+    signal details(var app)
+    readonly property bool hot: (app.cpu || 0) >= 80
+    readonly property var appName: ar.app.name || "unknown"
+    readonly property bool unsigned: !ar.app.verified
+    readonly property int rowH: Style.space(40)
+    // AppControl's secondary line: the publisher (or failing that the app's own
+    // description) in muted grey, directly under the bold name. Both fields
+    // already arrive in the snapshot via buildInventory(); they were simply
+    // never rendered.
+    readonly property string arSub: ar.app.publisher || ar.app.desc || ""
+    implicitHeight: rowH + (ar.actionsOpen ? Style.space(30) : 0)
+    width: parent ? parent.width : 0
+
+    BorderSurface {
+      id: arBase
+      width: parent.width
+      height: ar.rowH
+      radius: Style.cornerRadius
+      // AppControl-style flat rows: at rest the row is invisible and separation
+      // comes from whitespace alone. Tint is reserved for states that carry
+      // meaning (hot/disabled) plus hover and the open action row.
+      color: ar.hot ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, ar.hovered ? 0.14 : 0.08)
+           : (ar.app.disabled ? (ar.hovered ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.10) : "transparent")
+                              : (ar.hovered || ar.actionsOpen
+                                  ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.11)
+                                  : "transparent"))
+      borderSpec: ar.app.disabled
+          ? Border.flat(Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, ar.hovered ? 0.22 : 0.12), 1)
+          : (ar.actionsOpen
+              ? Border.flat(Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.35), 1)
+              : (ar.hovered
+                  ? Border.flat(Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.3), 1)
+                  : Border.none()))
+      Behavior on color { ColorAnimation { duration: 60 } }
+
+      // Monogram avatar (AppControl's circular app icon). app_meta carries no icon
+      // path, so the circle shows the app's initial on a stable per-name colour
+      // derived from root.avatarColor(), which blends toward the theme accent.
+      Rectangle {
+        id: arAvatar
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.rowAvatarSize
+        height: width
+        radius: width / 2
+        color: root.avatarColor(ar.appName)
+        Text {
+          anchors.centerIn: parent
+          textFormat: Text.PlainText
+          text: ar.appName.length > 0 ? ar.appName.charAt(0).toUpperCase() : "?"
+          color: root.onColor(root.avatarColor(ar.appName))
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+        }
+      }
+
+      Rectangle {
+        id: arRunDot
+        anchors.left: arAvatar.right
+        anchors.leftMargin: Style.space(6)
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.space(8)
+        height: Style.space(8)
+        radius: Style.space(4)
+        color: ar.app.running === false ? root.dim2
+             : (ar.hot ? root.urgent : Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.8))
+      }
+
+      // Two-tone hierarchy, AppControl-style: bold full-contrast name over a
+      // muted secondary line. When there is no publisher/description the block
+      // collapses to a single vertically-centred line.
+      Column {
+        anchors.left: arRunDot.right
+        anchors.leftMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        // Bounded on BOTH sides — left at the row lead, right at the chip slot's
+        // leading edge — so a long app name elides instead of running underneath
+        // the trust chips.
+        anchors.right: arTagSlot.left
+        anchors.rightMargin: root.nameGap
+        spacing: 1
+
+        Text {
+          id: arName
+          width: parent.width
+          elide: Text.ElideRight
+          textFormat: Text.PlainText
+          text: (ar.hot ? "\uf071  " : "") + ar.appName
+          // Name stays in the normal foreground; the run dot + CPU pill carry the
+          // load signal so a verified app never reads red.
+          color: root.fg
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.subtitle
+          font.bold: true
+        }
+        Text {
+          visible: ar.arSub !== ""
+          width: parent.width
+          elide: Text.ElideRight
+          textFormat: Text.PlainText
+          text: ar.arSub
+          color: root.muted
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      // Fixed-width chip slot pinned to the right edge, with the chips
+        // LEFT-aligned inside it, mirroring ProcRow — so the chips form a
+        // straight column down the list no matter what each row shows.
+        Item {
+          id: arTagSlot
+          anchors.right: parent.right
+          anchors.rightMargin: root.trustInset
+          anchors.verticalCenter: parent.verticalCenter
+          width: root.chipSlotW
+          height: Style.space(16)
+          Row {
+            id: arTags
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(4)
+        Rectangle {
+          visible: ar.app.disabled
+          // Collapsed while hidden: a Row still reserves space for invisible
+          // children, which used to leave a phantom void beside the chip.
+          width: ar.app.disabled ? arDisTxt.implicitWidth + Style.space(12) : 0
+          height: Style.space(16)
+          radius: Style.space(8)
+          color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.14)
+          Text {
+            id: arDisTxt
+            anchors.centerIn: parent
+            text: "\uf05e  Disabled"
+            color: root.dim1
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+        Rectangle {
+          visible: ar.app.verified
+          // Same fixed size as the Unsigned badge below — see trustChipW.
+          width: ar.app.verified ? root.trustChipW : 0
+          height: root.trustChipH
+          radius: root.trustChipR
+          // Solid, high-contrast green so the trusted state stays legible even
+          // when the row itself is tinted red for high CPU.
+          color: root.ok
+          border.width: 0
+          Text {
+            id: arVerTxt
+            anchors.centerIn: parent
+            text: "\uf058  Verified"
+            color: root.onColor(root.ok)
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+        Rectangle {
+          visible: ar.unsigned
+          // Identical geometry to the Verified badge, so the two states are the
+          // same size; only the palette differs.
+          width: ar.unsigned ? root.trustChipW : 0
+          height: root.trustChipH
+          radius: root.trustChipR
+          color: root.warnSoft
+          border.width: 1
+          border.color: Qt.rgba(root.warn.r, root.warn.g, root.warn.b, 0.5)
+          Text {
+            id: arUnsTxt
+            anchors.centerIn: parent
+            text: "\uf071  Unsigned"
+            color: root.warn
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+        Repeater {
+          model: ar.app.perms || []
+          delegate: Rectangle {
+            width: (modelData === "camera" ? Style.space(44) : (modelData === "mic" ? Style.space(34) : Style.space(58)))
+            height: Style.space(16)
+            radius: Style.space(8)
+            color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.10)
+            border.width: 1
+            border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.4)
+            Text {
+              anchors.centerIn: parent
+              text: modelData === "camera" ? "\uf030  Cam" : (modelData === "mic" ? "\uf130  Mic" : ("\uf124 " + modelData))
+              color: root.urgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+        }
+      }
+
+      Text {
+        id: arPid
+        anchors.right: parent.right
+        anchors.rightMargin: root.colRight("pid")
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.colWidth("pid")
+        horizontalAlignment: Text.AlignHCenter
+        text: (function() {
+          var p = ar.app.pids || []
+          if (p.length === 0) return ""
+          if (p.length === 1) return String(p[0])
+          return String(p[0]) + " +" + (p.length - 1)
+        })()
+        elide: Text.ElideRight
+        color: root.dim1
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Sparkline {
+        id: arSpark
+        anchors.right: parent.right
+        anchors.rightMargin: root.colRight("trend")
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.colWidth("trend")
+        height: Style.space(14)
+        data: ar.app.spark || []
+      }
+      Text {
+        id: arNet
+        anchors.right: parent.right
+        anchors.rightMargin: root.colRight("net")
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.colWidth("net")
+        horizontalAlignment: Text.AlignHCenter
+        text: root.fmtNet((root.sample.net_rx_kbs || 0) + (root.sample.net_tx_kbs || 0))
+        color: root.dim1
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Text {
+        id: arDisk
+        anchors.right: parent.right
+        anchors.rightMargin: root.colRight("disk")
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.colWidth("disk")
+        horizontalAlignment: Text.AlignHCenter
+        text: root.fmtNet(ar.app.io || 0)
+        color: root.dim1
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Text {
+        id: arGpu
+        anchors.right: parent.right
+        anchors.rightMargin: root.colRight("gpu")
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.colWidth("gpu")
+        horizontalAlignment: Text.AlignHCenter
+        text: Math.round(ar.app.gpu || 0) + "%"
+        color: root.dim1
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Text {
+        id: arMem
+        anchors.right: parent.right
+        anchors.rightMargin: root.colRight("mem")
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.colWidth("mem")
+        horizontalAlignment: Text.AlignHCenter
+        text: Math.round(ar.app.mem || 0) + "%"
+        color: root.dim1
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Rectangle {
+        id: arCpu
+        anchors.right: parent.right
+        anchors.rightMargin: root.colRight("cpu")
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.colWidth("cpu")
+        height: Style.space(16)
+        radius: Style.space(8)
+        color: ar.hot ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.14)
+                      : Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.10)
+        Text {
+          anchors.centerIn: parent
+          text: Math.round(ar.app.cpu || 0) + "%"
+          color: ar.hot ? root.urgent : root.fg
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+      }
+      Rectangle {
+        id: arMenuAnc
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.space(24)
+        height: Style.space(22)
+        radius: Style.space(12)
+        color: ar.actionsOpen ? root.accentSoft : "transparent"
+        Text {
+          anchors.centerIn: parent
+          text: ar.actionsOpen ? "\uf078" : "\uf054"
+          color: root.dim1
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+        MouseArea {
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onEntered: ar.hovered = true
+          onExited: ar.hovered = false
+          onClicked: ar.actionsOpen = !ar.actionsOpen
+        }
+      }
+      MouseArea {
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onEntered: ar.hovered = true
+        onExited: ar.hovered = false
+        onClicked: ar.actionsOpen = !ar.actionsOpen
+      }
+    }
+
+    Row {
+      visible: ar.actionsOpen
+      anchors.top: arBase.bottom
+      anchors.topMargin: Style.space(4)
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(10)
+      height: Style.space(22)
+      spacing: Style.space(6)
+      ActionChip { visible: ar.app.pids && ar.app.pids.length > 0; label: "Terminate"; danger: true; onChosen: ar.kill(ar.appName) }
+      ActionChip { label: ar.app.disabled ? "Enable" : "Disable";
+        onChosen: ar.app.disabled ? ar.enable(ar.appName) : ar.disable(ar.appName) }
+      ActionChip { visible: ar.app.pids && ar.app.pids.length > 0; label: "Suspend"; onChosen: root.appAction("stop", ar.appName) }
+      ActionChip { visible: ar.app.pids && ar.app.pids.length > 0; label: "Resume"; onChosen: root.appAction("cont", ar.appName) }
+      ActionChip { visible: ar.app.pids && ar.app.pids.length > 0; label: "Slow down"; onChosen: root.appAction("slow", ar.appName) }
+      ActionChip { visible: ar.app.pids && ar.app.pids.length > 0; label: "Speed up"; onChosen: root.appAction("fast", ar.appName) }
+      ActionChip { label: "Details"; onChosen: ar.details(ar.app) }
+    }
+  }
+
+  component AlertRow: Item {
+    id: alr
+    property var alert: ({})
+    property bool hovered: false
+    signal dismissed()
+    implicitHeight: Style.space(36)
+    width: parent ? parent.width : 0
+    readonly property color dot: alr.alert.severity === "critical" ? root.urgent
+                : (alr.alert.severity === "warning" ? root.accent : root.dim1)
+
+    BorderSurface {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      // Flat at rest; the severity dot is the colour carrier and the fill is
+      // reserved for critical alerts and hover.
+      color: alr.dot === root.urgent
+          ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, alr.hovered ? 0.13 : 0.07)
+          : (alr.hovered ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.11) : "transparent")
+      borderSpec: alr.hovered
+          ? Border.flat(Qt.rgba(alr.dot.r, alr.dot.g, alr.dot.b, 0.3), 1)
+          : Border.none()
+      Behavior on color { ColorAnimation { duration: 60 } }
+    }
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      onEntered: alr.hovered = true
+      onExited: alr.hovered = false
+    }
+    Rectangle {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(8)
+      height: Style.space(8)
+      radius: Style.space(4)
+      color: alr.dot
+    }
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(28)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(44)
+      text: { var k = alr.alert.kind || ""; k === "proc" ? "PROC" : k.toUpperCase() }
+      color: root.dim1
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+    }
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(80)
+      anchors.right: dismissBtn.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      textFormat: Text.PlainText
+      text: alr.alert.msg || ""
+      color: root.fg
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+    Text {
+      anchors.right: dismissBtn.left
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      text: root.fmtAgo(alr.alert.ts || 0)
+      color: root.dim2
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Rectangle {
+      id: dismissBtn
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(22)
+      height: Style.space(22)
+      radius: Style.space(12)
+      color: "transparent"
+      Text {
+        anchors.centerIn: parent
+        text: "\uf00d"
+        color: root.dim1
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+      }
+      MouseArea {
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: alr.dismissed()
+      }
+    }
+  }
+
+  component EventRow: Item {
+    id: evr
+    property var event: ({})
+    signal markRead(int id)
+    signal kill(string name)
+    signal disable(string name)
+    signal enable(string name)
+    signal details(var event)
+    readonly property bool unread: !(event.read)
+    readonly property bool actionsOpen: evr.actionOpen
+    readonly property bool hasApp: (event.app || "") !== ""
+    readonly property string kindLabel: {
+      var k = event.kind || ""
+      if (k === "app_launch" || k === "new_app") return "Launch"
+      if (k === "app_exit") return "Exit"
+      if (k === "cpu_spike" || k === "mem_spike") return "Spike"
+      if (k === "mic_access") return "Mic"
+      if (k === "cam_access") return "Cam"
+      if (k === "location_access") return "Loc"
+      if (k === "publisher_block" || k === "unsigned_launch" || k === "unknown_app") return "Security"
+      if (k.indexOf("user_") === 0) return "Action"
+      return (k || "Event").toUpperCase()
+    }
+    readonly property color typed: root.eventTypeColor(event.kind || "")
+    readonly property string icon: root.eventIcon(event.kind || "")
+    property bool actionOpen: false
+    property bool hovered: false
+    implicitHeight: (evr.actionOpen ? Style.space(60) : Style.space(36))
+    width: parent ? parent.width : 0
+
+    BorderSurface {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      // Flat at rest like AppControl, but an UNREAD event keeps its accent fill —
+      // that is a real state ("you haven't seen this yet"), not decoration.
+      color: evr.unread
+          ? (evr.hovered ? root.mixColor(root.accentSoft, root.accent, 0.12) : root.accentSoft)
+          : (evr.hovered ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.11) : "transparent")
+      borderSpec: evr.unread || evr.hovered
+          ? Border.flat(Qt.rgba(evr.typed.r, evr.typed.g, evr.typed.b, evr.hovered ? 0.32 : 0.18), 1)
+          : Border.none()
+      Behavior on color { ColorAnimation { duration: 60 } }
+    }
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      onEntered: evr.hovered = true
+      onExited: evr.hovered = false
+    }
+    Rectangle {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(6)
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(6)
+      width: Style.space(3)
+      height: Style.space(18)
+      radius: Style.space(2)
+      color: evr.typed
+    }
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(18)
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(5)
+      width: Style.space(20)
+      height: Style.space(20)
+      horizontalAlignment: Text.AlignHCenter
+      text: evr.icon
+      color: evr.typed
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Rectangle {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(48)
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(5)
+      width: Style.space(56)
+      height: Style.space(15)
+      radius: Style.space(8)
+      color: Qt.rgba(evr.typed.r, evr.typed.g, evr.typed.b, 0.15)
+      Text {
+        anchors.centerIn: parent
+        text: evr.kindLabel
+        color: evr.typed
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+    }
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(112)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(96)
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(5)
+      height: Style.space(20)
+      verticalAlignment: Text.AlignVCenter
+      textFormat: Text.PlainText
+      text: (hasApp ? (event.app + " — ") : "") + (event.msg || "")
+      color: root.fg
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: evr.unread
+      elide: Text.ElideRight
+    }
+    Text {
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(44)
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(5)
+      height: Style.space(20)
+      verticalAlignment: Text.AlignVCenter
+      text: root.fmtAgo(event.ts || 0)
+      color: root.dim2
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Text {
+      id: evrChevron
+      z: 5
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(5)
+      width: Style.space(26)
+      height: Style.space(20)
+      horizontalAlignment: Text.AlignHCenter
+      verticalAlignment: Text.AlignVCenter
+      text: evr.actionOpen ? "\uf077" : "\uf078"
+      color: root.dim2
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+      MouseArea {
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: evr.actionOpen = !evr.actionOpen
+      }
+    }
+    Row {
+      z: 4
+      visible: evr.actionOpen
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(36)
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(112)
+      spacing: Style.space(6)
+      height: Style.space(22)
+      ActionChip {
+        label: "Details"
+        onChosen: evr.details(evr.event)
+      }
+      ActionChip {
+        visible: evr.unread
+        label: "Mark read"
+        onChosen: evr.markRead(evr.event.id)
+      }
+      ActionChip {
+        visible: evr.hasApp
+        label: "Kill"
+        danger: true
+        onChosen: evr.kill(evr.event.app)
+      }
+      ActionChip {
+        visible: evr.hasApp && evr.event.kind !== "user_disable"
+        label: "Disable"
+        onChosen: evr.disable(evr.event.app)
+      }
+      ActionChip {
+        visible: evr.hasApp && evr.event.kind === "user_disable"
+        label: "Enable"
+        onChosen: evr.enable(evr.event.app)
+      }
+    }
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: evr.details(evr.event)
+    }
+  }
+
+  component EventDetailPanel: Item {
+    id: edp
+    property var event: ({})
+
+    // Card sizing: hug the content up to the space the page can spare, then
+    // scroll instead of clipping. The body is measured inside the Flickable, so
+    // the card grows to fit a tall event and stops at the viewport rather than
+    // shearing the last rows off.
+    readonly property real cardW: Math.min(parent.width * 0.5, Style.space(420))
+    readonly property real cardMaxH: Math.max(Style.space(160), parent.height - Style.space(80))
+
+    // Guarded alias so the hidden panel (event === null) never hits null derefs.
+    readonly property var ev: edp.event || {}
+    signal close()
+    signal kill(string name)
+    signal disable(string name)
+    signal enable(string name)
+    readonly property color typed: root.eventTypeColor(edp.ev.kind || "")
+    readonly property bool hasApp: (edp.ev.app || "") !== ""
+    readonly property var snapProcs: root.topAt(edp.ev.ts || 0, 8)
+    readonly property bool loading: root.eventCtxBusy && !root.eventCtx
+    readonly property string verifiedLine: (function() {
+      var a = root.eventCtx && root.eventCtx.app
+      if (!a) return ""
+      var tag = a.verified ? "\uf058 Verified" : "\uf071 Unsigned"
+      var pub = (a.publisher && a.publisher !== "Unknown" && a.publisher !== "")
+          ? " · " + a.publisher : ""
+      return tag + pub
+    })()
+    readonly property string appDesc: (root.eventCtx && root.eventCtx.app && root.eventCtx.app.desc) || ""
+    readonly property var ctxApp: root.eventCtx && root.eventCtx.app
+    readonly property bool ctxAppVerified: !!(edp.ctxApp && edp.ctxApp.verified)
+    readonly property string ctxAppPublisher: (edp.ctxApp && edp.ctxApp.publisher) || ""
+    readonly property string siblingsLine: (function() {
+      var c = root.eventCtx
+      if (!c) return ""
+      var parts = []
+      if (edp.hasApp && typeof c.app_count === "number") parts.push(c.app_count + "× this app")
+      if (typeof c.kind_count === "number") parts.push(c.kind_count + "× of this kind")
+      return parts.length ? "This week: " + parts.join(" · ") : ""
+    })()
+    readonly property var ctxPills: (function() {
+      var s = root.eventCtx && root.eventCtx.state
+      if (!s) return []
+      var arr = [
+        { k: "CPU", v: Math.round(s.cpu) + "%" },
+        { k: "MEM", v: (s.mem_pct || 0) + "%" },
+        { k: "GPU", v: Math.round(s.gpu) + "%" },
+        { k: "PROCS", v: "" + s.procs }
+      ]
+      if (s.cpu_temp) arr.push({ k: "CPU TMP", v: s.cpu_temp + "°" })
+      if (s.gpu_temp) arr.push({ k: "GPU TMP", v: s.gpu_temp + "°" })
+      return arr
+    })()
+
+    Rectangle {
+      anchors.fill: parent
+      color: Color.menu.scrim
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: edp.close()
+      }
+    }
+
+    BorderSurface {
+      id: edpCard
+      // Hugs edpFlick's content up to cardMaxH, then scrolls.
+      width: edp.cardW
+      height: Math.min(edp.cardMaxH, edpFlick.contentHeight + Style.space(44))
+      anchors.centerIn: parent
+      radius: Style.space(16)
+      color: root.surface
+      // Same themed border spec as the main card, so the modal reads as part of
+      // the same surface family rather than a plain outlined rectangle.
+      borderSpec: root.cardBorderSpec
+      clip: true
+      MouseArea { anchors.fill: parent }
+
+      // Close affordance with a hover state, matching the pill/chip treatment
+      // used everywhere else instead of a bare glyph.
+      Rectangle {
+        anchors.top: parent.top
+        anchors.topMargin: Style.space(10)
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(12)
+        width: Style.space(22)
+        height: Style.space(22)
+        radius: width / 2
+        color: edpCloseHover.containsMouse
+               ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.18) : "transparent"
+        Behavior on color { ColorAnimation { duration: 60 } }
+        Text {
+          anchors.centerIn: parent
+          text: "\uf00d"
+          color: edpCloseHover.containsMouse ? root.fg : root.dim2
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.body
+        }
+        MouseArea {
+          id: edpCloseHover
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: edp.close()
+        }
+      }
+
+      Flickable {
+        id: edpFlick
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(20)
+        anchors.rightMargin: Style.space(20)
+        anchors.topMargin: Style.space(20)
+        anchors.bottomMargin: Style.space(20)
+        contentWidth: width
+        contentHeight: edpBody.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+        clip: true
+
+      Column {
+        id: edpBody
+        width: edpFlick.width
+        spacing: Style.space(10)
+
+        Row {
+          id: edpHead
+          width: edpBody.width
+          spacing: Style.space(10)
+          Rectangle {
+            width: Style.space(36)
+            height: Style.space(36)
+            radius: width / 2
+            color: edp.typed
+            Text {
+              anchors.centerIn: parent
+              text: root.eventIcon(edp.ev.kind || "")
+              color: "white"
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+            }
+          }
+          Column {
+            anchors.verticalCenter: parent.verticalCenter
+            // Bounded so a long app name elides instead of sliding under the
+            // close button (the trailing reserve clears it).
+            width: Math.max(Style.space(60), edpHead.width - Style.space(36)
+                            - Style.space(10) - Style.space(34))
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: edp.ev.app || "System"
+              color: root.fg
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.heading
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: edp.ev.publisher || "Unknown"
+              color: root.dim1
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+        Text {
+          width: edpBody.width
+          text: root.eventKindLabel(edp.ev.kind || "")
+          color: edp.typed
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+        Text {
+          width: edpBody.width
+          text: root.eventKindExplain(edp.ev.kind || "")
+          wrapMode: Text.WordWrap
+          color: root.dim1
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+        Text {
+          width: edpBody.width
+          textFormat: Text.PlainText
+          text: edp.ev.msg || ""
+          wrapMode: Text.WordWrap
+          color: root.fg
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+        Text {
+          text: root.fmtFullDate(edp.ev.ts || 0)
+          color: root.dim2
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+        Text {
+          visible: edp.loading
+          text: "Loading context\u2026"
+          color: root.dim2
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          font.italic: true
+        }
+        Rectangle {
+          visible: edp.hasApp && !edp.loading
+          width: edpBody.width
+          color: edp.typed.a < 0.05 ? root.surface : Qt.rgba(edp.typed.r, edp.typed.g, edp.typed.b, 0.08)
+          radius: Style.space(10)
+          border.width: 1
+          border.color: Qt.rgba(edp.typed.r, edp.typed.g, edp.typed.b, 0.25)
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(10)
+            spacing: Style.space(4)
+            Text {
+              visible: edp.verifiedLine !== ""
+              textFormat: Text.PlainText
+              text: edp.verifiedLine
+              color: edp.ctxAppVerified ? root.ok : root.warn
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+            Text {
+              visible: edp.ctxAppPublisher !== "" && edp.verifiedLine === ""
+              textFormat: Text.PlainText
+              text: edp.ctxAppPublisher
+              color: root.dim1
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              visible: edp.appDesc !== ""
+              width: edpBody.width - Style.space(22)
+              textFormat: Text.PlainText
+              text: edp.appDesc
+              wrapMode: Text.WordWrap
+              color: root.dim1
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+        // Six fixed-width pills overflowed the card and clipped their own labels
+        // ("CPU TMP"/"GPU TMP"). Flow + label-driven width means they wrap and
+        // stay legible at any count.
+        Flow {
+          visible: edp.ctxPills.length > 0
+          width: edpBody.width
+          spacing: Style.space(6)
+          Repeater {
+            model: edp.ctxPills
+            delegate: Rectangle {
+              width: Math.max(Style.space(52), edpPillKey.implicitWidth + Style.space(18))
+              height: Style.space(34)
+              radius: Style.space(8)
+              color: root.accentSoft
+              Column {
+                anchors.centerIn: parent
+                spacing: Style.space(1)
+                Text {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  text: modelData.v
+                  color: root.fg
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+                Text {
+                  id: edpPillKey
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  text: modelData.k
+                  color: root.dim2
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+        }
+        Text {
+          visible: edp.siblingsLine !== ""
+          textFormat: Text.PlainText
+          text: edp.siblingsLine
+          color: root.dim2
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+        // A hairline rule turns the process list into a labelled block — the same
+        // quiet-heading treatment the table headers use elsewhere.
+        Column {
+          width: edpBody.width
+          spacing: Style.space(6)
+          Rectangle {
+            width: parent.width
+            height: 1
+            color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.25)
+          }
+          Text {
+            text: "PROCESSES AT " + root.fmtTime(edp.ev.ts || 0)
+            color: root.dim2
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1
+          }
+        }
+        Text {
+          visible: edp.snapProcs.length === 0
+          width: edpBody.width
+          text: "No minute snapshot captured for this exact moment"
+          color: root.dim2
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+        Repeater {
+          model: edp.snapProcs
+          delegate: Item {
+            id: evProc
+            readonly property bool isEvApp: (modelData.name || "").toLowerCase() === (edp.ev.app || "").toLowerCase()
+            width: edpBody.width - Style.space(2)
+            height: Style.space(19)
+            // One left-aligned label owns the row. This used to pair it with a
+            // second Text pinned right ("17% CPU · 3963200") whose raw MB value
+            // ran together into an unreadable block of digits; removing it lets
+            // the name use the full width and simply elide.
+            Text {
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: (evProc.isEvApp ? "\u25c9 " : "") + (modelData.name || "unknown")
+              color: evProc.isEvApp ? root.accent : root.fg
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: evProc.isEvApp
+              elide: Text.ElideRight
+            }
+          }
+        }
+        Row {
+          spacing: Style.space(8)
+          ActionChip {
+            visible: edp.hasApp
+            label: "Kill"
+            danger: true
+            onChosen: edp.kill(edp.ev.app)
+          }
+          ActionChip {
+            visible: edp.hasApp && edp.ev.kind !== "user_disable"
+            label: "Disable"
+            onChosen: edp.disable(edp.ev.app)
+          }
+          ActionChip {
+            visible: edp.hasApp && edp.ev.kind === "user_disable"
+            label: "Enable"
+            onChosen: edp.enable(edp.ev.app)
+          }
+          ActionChip {
+            visible: true
+            label: "Web Search"
+            onChosen: root.openEventSearch(edp.ev)
+          }
+        }
+      }
+      }
+    }
+  }
+
+  component DetailsPanel: Item {
+    id: dp
+    property var app: null
+    property var stats: null
+    property bool statsBusy: false
+    property var netInfo: null
+    property bool netBusy: false
+    property bool procOpen: false
+    property bool procShowAll: false
+    // The "How to read the values" glossary is reference material, not the
+    // reason the user opened the panel, so it starts collapsed.
+    property bool legendOpen: false
+    // Pid of the row whose binary was last handed to the desktop opener, shown
+    // as a brief inline confirmation so a click has visible feedback.
+    property int lastRevealed: -1
+    Timer {
+      id: revealTimer
+      interval: 1600
+      repeat: false
+      onTriggered: dp.lastRevealed = -1
+    }
+    // Upper bound supplied by the caller (the space between the card's top bar
+    // and the bottom nav). The panel grows to fit its content up to this cap
+    // and scrolls beyond it, so there is never a dead gap above the buttons.
+    property real maxPanelHeight: 0
+    signal close()
+    signal kill(string name)
+    signal disable(string name)
+    signal enable(string name)
+    width: parent ? parent.width : 0
+    implicitHeight: Style.space(300)
+    // Header (avatar + name + badges) + description, then the scroll body at its
+    // natural height (capped), then the action-chip row and its margins.
+    readonly property real bodyH: dpScroll.contentHeight
+    height: {
+      var head = dpDesc.y + dpDesc.height + Style.space(14)
+      var body = dpScroll.contentHeight
+      var chips = Style.space(44)
+      var want = head + body + chips
+      return maxPanelHeight > 0 ? Math.min(want, maxPanelHeight) : want
+    }
+
+    function binaryPath() {
+      if (!dp.app) return ""
+      var parts = []
+      if (dp.app.exe) parts.push("exe: " + dp.app.exe)
+      if (dp.app.pkg) parts.push("pkg: " + dp.app.pkg)
+      return parts.join("   ·   ")
+    }
+    function statEntries() {
+      if (!dp.stats) return []
+      var s = dp.stats
+      function r(x) { return Math.round(x * 10) / 10 }
+      return [
+        { k: "PEAK CPU", v: r(s.max_cpu) + " %" },
+        { k: "AVG CPU", v: r(s.avg_cpu) + " %" },
+        { k: "PEAK MEM", v: r(s.max_mem_mb) + " MB" },
+        { k: "AVG MEM", v: r(s.avg_mem_mb) + " MB" },
+        { k: "PEAK GPU", v: r(s.max_gpu) + " %" },
+        { k: "PEAK I/O", v: root.fmtNetFull(s.max_io_kbs) }
+      ]
+    }
+    function stampLine() {
+      if (!dp.stats) return dp.statsBusy ? "Scanning tracked history…" : ""
+      function d(ts) { return new Date(ts * 1000).toLocaleDateString() }
+      return "Since first tracked: " + dp.stats.samples + " samples · " + d(dp.stats.first_ts) + " → " + d(dp.stats.last_ts)
+    }
+    function cpuNote() {
+      if (!dp.stats) return ""
+      var cores = dp.stats.cores || 0
+      return (cores > 1 ? "CPU is an average across all " + Math.round(cores)
+              + " cores — 100% means one core fully busy" : "CPU is shown per core — 100% = one core fully busy")
+    }
+    function netLine() {
+      if (dp.netInfo) {
+        var parts = []
+        if (dp.netInfo.established) parts.push(dp.netInfo.established + " tcp connections")
+        if (dp.netInfo.listening) parts.push(dp.netInfo.listening + " listening")
+        if (dp.netInfo.udp) parts.push(dp.netInfo.udp + " udp")
+        return parts.length ? "Network: " + parts.join(" · ") : "Network: no open sockets"
+      }
+      return dp.netBusy ? "Scanning network sockets…" : ""
+    }
+    function procShown() {
+      var arr = root.procDetail || []
+      if (!arr.length) return []
+      return arr.slice(0, dp.procShowAll ? arr.length : 6)
+    }
+    // Per-app CPU trend, aggregated across every instance of the app by name so
+    // a 2-instance python3 reads as one series rather than two ragged ones —
+    // the same aggregation the PEAK CPU tile already uses. Built from
+    // sample.snaps, which the collector writes once a minute (proc_history is
+    // keyed on PROC_TS = PROC_MIN*60) and sample-json.sh ships as the newest 90
+    // rows, so the window is ~90 minutes at 1-minute resolution.
+    //
+    // Snapshots where the app was absent are NOT back-filled with 0: the app
+    // genuinely wasn't running, and a zero there would read as "idle" when it
+    // means "not present". Missing minutes are skipped instead, leaving a gap
+    // in the line.
+    function trendSeries() {
+      var name = dp.app ? dp.app.name : ""
+      if (!name) return []
+      var snaps = root.sample.snaps || []
+      var out = []
+      for (var i = 0; i < snaps.length; i++) {
+        var procs = snaps[i].procs || []
+        var sum = 0, found = false
+        for (var j = 0; j < procs.length; j++) {
+          if (procs[j].name === name) { sum += procs[j].cpu || 0; found = true }
+        }
+        if (found) out.push({ ts: snaps[i].ts, v: sum })
+      }
+      return out
+    }
+    // Span + peak of the series, for the caption under the chart.
+    function trendSummary() {
+      var pts = dp.trendSeries()
+      if (!pts.length) return ""
+      var peak = 0, sum = 0
+      for (var i = 0; i < pts.length; i++) {
+        if (pts[i].v > peak) peak = pts[i].v
+        sum += pts[i].v
+      }
+      var mins = Math.round((pts[pts.length - 1].ts - pts[0].ts) / 60)
+      return Math.round(peak * 10) / 10 + "% peak · "
+           + (Math.round((sum / pts.length) * 10) / 10) + "% avg · last "
+           + mins + " min"
+    }
+    function procMore() { return Math.max(0, (root.procDetail || []).length - 6) }
+    function statLegend() {
+      if (!dp.stats) return []
+      var s = dp.stats
+      function r(x) { return Math.round(x * 10) / 10 }
+      var arr = []
+      arr.push({ h: "PEAK CPU", d: "average across all cores — 100% means one core fully busy" })
+      arr.push({ h: "AVG CPU", d: "mean of the above across all tracked samples" })
+      arr.push({ h: "PEAK MEM", d: "largest resident RAM footprint in MB" })
+      arr.push({ h: "AVG MEM", d: "mean resident RAM footprint in MB" })
+      arr.push({ h: "PEAK GPU", d: "GPU utilization %, sampled while it was the top GPU process" })
+      arr.push({ h: "PEAK I/O", d: "highest disk throughput (read + write), auto-scaled KB/s → MB/s → GB/s" })
+      arr.push({ h: "NET", d: "live TCP/UDP socket count for this app right now" })
+      return arr
+    }
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.space(12)
+      color: root.surface
+      border.width: 1
+      border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.45)
+    }
+
+    // Header: monogram avatar + prominent name + trust badge, matching the
+      // row treatment so the panel reads as the same family.
+      Row {
+        id: dpHead
+        anchors.top: parent.top
+        anchors.topMargin: Style.space(14)
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(14)
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(16)
+        spacing: Style.space(10)
+        Rectangle {
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(34)
+          height: width
+          radius: width / 2
+          color: dp.app && dp.app.verified ? root.ok
+                                         : root.avatarColor((dp.app && dp.app.name) || "")
+          Text {
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: (dp.app && dp.app.name ? dp.app.name.charAt(0).toUpperCase() : "?")
+            color: root.onColor(dp.app && dp.app.verified ? root.ok
+                                                          : root.avatarColor((dp.app && dp.app.name) || ""))
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+          }
+        }
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          textFormat: Text.PlainText
+          text: (dp.app && dp.app.name) || ""
+          color: root.fg
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.heading
+          font.bold: true
+          elide: Text.ElideRight
+          width: Math.min(implicitWidth, dpHead.width - Style.space(160))
+        }
+        Rectangle {
+          anchors.verticalCenter: parent.verticalCenter
+          visible: dp.app && !dp.app.verified
+          width: Style.space(62); height: Style.space(18); radius: height / 2
+          color: root.warnSoft
+          border.width: 1
+          border.color: Qt.rgba(root.warn.r, root.warn.g, root.warn.b, 0.45)
+          Text { anchors.centerIn: parent; text: "Unsigned"; color: root.warn; font.family: root.contentFontFamily; font.pixelSize: Style.font.caption }
+        }
+        Rectangle {
+          anchors.verticalCenter: parent.verticalCenter
+          visible: dp.app && dp.app.verified
+          width: Style.space(72); height: Style.space(18); radius: height / 2
+          color: root.ok
+          border.width: 0
+          Text { anchors.centerIn: parent; text: "Verified"; color: root.onColor(root.ok); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+        }
+        Rectangle {
+          anchors.verticalCenter: parent.verticalCenter
+          visible: !!(dp.app && dp.app.perms && dp.app.perms.length > 0)
+          width: Math.min(Style.space(120), Style.space(14) + dpPermText.implicitWidth)
+          height: Style.space(18); radius: height / 2
+          color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.10)
+          border.width: 1
+          border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.4)
+          Text {
+            id: dpPermText
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: (dp.app && dp.app.perms ? dp.app.perms : []).join(", ")
+            color: root.urgent
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+        }
+      }
+
+    Text {
+      id: dpMeta
+      anchors.top: dpHead.bottom
+      anchors.topMargin: Style.space(8)
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(14)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(14)
+      textFormat: Text.PlainText
+      text: (dp.app && dp.app.source || "unknown")
+          + "   ·   disabled: " + (dp.app && dp.app.disabled ? "yes" : "no")
+          + "   ·   instances: " + (dp.app ? (dp.app.instances !== undefined ? dp.app.instances : (dp.app.pids ? dp.app.pids.length : 0)) : 0)
+      color: root.dim2
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+    Text {
+      id: dpDesc
+      anchors.top: dpMeta.bottom
+      anchors.topMargin: Style.space(6)
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(14)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(14)
+      textFormat: Text.PlainText
+      text: (dp.app && dp.app.desc && dp.app.desc.trim() !== "")
+        ? dp.app.desc
+        : ((dp.app && dp.app.exe) ? ("Binary: " + dp.app.exe + " — no description available.")
+                                  : "No description available for this binary.")
+      color: root.dim1
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.body
+      wrapMode: Text.WordWrap
+      maximumLineCount: 3
+      elide: Text.ElideRight
+    }
+    Flickable {
+      id: dpScroll
+      anchors.top: dpDesc.bottom
+      anchors.topMargin: Style.space(14)
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(14)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(14)
+      // Sized to its content (bounded by the space left after the header and
+      // the action chips) so the panel can hug its content; overflow scrolls.
+      height: Math.max(0, Math.min(dpScroll.contentHeight,
+                                   dp.height - (dpDesc.y + dpDesc.height + Style.space(14)) - Style.space(46)))
+      clip: true
+      contentWidth: width
+      contentHeight: dpInfo.implicitHeight
+      boundsBehavior: Flickable.StopAtBounds
+
+      Column {
+        id: dpInfo
+        width: dpScroll.width
+        spacing: Style.space(12)
+
+      Text {
+        width: parent.width
+        visible: dp.binaryPath() !== ""
+        textFormat: Text.PlainText
+        text: dp.binaryPath()
+        color: root.dim2
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+
+      // Flat stat tiles, AppControl-style: no border, no fill at rest — a quiet
+      // uppercase label over a large figure, separated by whitespace alone.
+      Flow {
+        id: dpStatsFlow
+        width: parent.width
+        spacing: Style.space(10)
+        Repeater {
+          model: dp.statEntries()
+          delegate: Item {
+            width: (dpStatsFlow.width - Style.space(10)) / 2
+            height: Style.space(38)
+            Text {
+              id: dpStatKey
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              text: modelData.k
+              color: root.dim2
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.letterSpacing: 1
+              font.bold: true
+              elide: Text.ElideRight
+            }
+            Text {
+              anchors.top: dpStatKey.bottom
+              anchors.topMargin: Style.space(2)
+              anchors.left: parent.left
+              anchors.right: parent.right
+              text: modelData.v
+              color: root.fg
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.heading
+              font.bold: true
+              elide: Text.ElideRight
+            }
+          }
+        }
+      }
+
+      // Per-app CPU trend. Sits directly under the stat tiles so the headline
+      // numbers read as a summary of the curve below them. Only CPU is charted:
+      // across the tracked window cpu is non-zero for every app, while mem/gpu/
+      // io have data for only a minority, so charting them would mostly draw a
+      // flat zero line and imply "idle" rather than "not collected".
+      Item {
+        width: parent.width
+        height: Style.space(74)
+        visible: dp.trendSeries().length >= 2
+
+        Text {
+          id: dpTrendLabel
+          anchors.top: parent.top
+          anchors.left: parent.left
+          text: "CPU TREND"
+          color: root.dim2
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          font.letterSpacing: 1
+          font.bold: true
+        }
+        Text {
+          anchors.top: dpTrendLabel.top
+          anchors.right: parent.right
+          text: dp.trendSummary()
+          color: root.dim1
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+
+        Canvas {
+          id: dpTrend
+          anchors.top: dpTrendLabel.bottom
+          anchors.topMargin: Style.space(6)
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          // Re-read the series on a timer rather than binding it: trendSeries()
+          // is a function over sample.snaps, and function calls are not tracked
+          // as dependencies, so a binding would freeze. sampleProc refreshes
+          // every 4s and snaps are minute-aligned, so 1s is ample and cheap
+          // (the canvas only repaints when the point count actually changes).
+          property int lastCount: -1
+          property int lastSpan: -1
+          Timer {
+            interval: 1000
+            repeat: true
+            running: dp.app !== null
+            onTriggered: {
+              var s = dp.trendSeries()
+              if (s.length !== dpTrend.lastCount || s.length && s[s.length - 1].ts !== dpTrend.lastSpan) {
+                dpTrend.lastCount = s.length
+                dpTrend.lastSpan = s.length ? s[s.length - 1].ts : -1
+                dpTrend.requestPaint()
+              }
+            }
+          }
+          onWidthChanged: requestPaint()
+          onPaint: {
+            var ctx = getContext("2d")
+            ctx.reset()
+            var pts = dp.trendSeries()
+            if (pts.length < 2) return
+            var w = width, h = height
+            var topPad = 3, bottomPad = 3
+            var plotH = Math.max(4, h - topPad - bottomPad)
+            // X spans the series' own time range rather than the index, so a
+            // minute where the app was absent leaves a proportional gap instead
+            // of silently compressing the remaining points together.
+            var t0 = pts[0].ts, t1 = pts[pts.length - 1].ts
+            var spanT = Math.max(1, t1 - t0)
+            // Y is scaled to the data, not to 100: these are per-app averages
+            // across cores, so a busy app rarely approaches 100 and a fixed
+            // ceiling would flatten every trend into a straight line.
+            var mx = 0
+            for (var i = 0; i < pts.length; i++) if (pts[i].v > mx) mx = pts[i].v
+            var yMax = Math.max(1, mx * 1.15)
+
+            // Baseline, drawn faintly so the plot reads as sitting on a floor.
+            ctx.strokeStyle = Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.12)
+            ctx.lineWidth = 1
+            ctx.beginPath()
+            ctx.moveTo(0, topPad + plotH + 0.5)
+            ctx.lineTo(w, topPad + plotH + 0.5)
+            ctx.stroke()
+
+            var xOf = function(p) { return (p.ts - t0) / spanT * w }
+            var yOf = function(p) {
+              return topPad + plotH - Math.max(0, Math.min(yMax, p.v)) / yMax * plotH
+            }
+
+            // Filled area under the curve, split at gaps so an absent minute is
+            // a real break in the fill instead of a straight chord across it.
+            // Split the series into runs of consecutive samples. A gap wider than 1.9x the
+            // median spacing means the app was missing from that snapshot, which
+            // must break BOTH the fill and the stroke — otherwise a chord is
+            // drawn straight across a minute the app wasn't running, implying
+            // data that was never collected.
+            var runs = []
+            var cur = []
+            for (var i = 0; i < pts.length; i++) {
+              if (cur.length === 0) { cur.push(pts[i]); continue }
+              var gap = pts[i].ts - pts[cur.length - 1].ts
+              if (gap > 90) { runs.push(cur); cur = [pts[i]] }   // >90s == a skipped minute
+              else cur.push(pts[i])
+            }
+            if (cur.length) runs.push(cur)
+
+            var xOf = function(p) { return (p.ts - t0) / spanT * w }
+            var yOf = function(p) {
+              return topPad + plotH - Math.max(0, Math.min(yMax, p.v)) / yMax * plotH
+            }
+
+            var grad = ctx.createLinearGradient(0, topPad, 0, topPad + plotH)
+            grad.addColorStop(0, Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.26))
+            grad.addColorStop(1, Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.0))
+
+            // Filled area under the curve, one closed path per run so the fill
+            // never bleeds across a gap.
+            for (var r = 0; r < runs.length; r++) {
+              var run = runs[r]
+              if (run.length < 2) continue
+              ctx.beginPath()
+              ctx.moveTo(xOf(run[0]), yOf(run[0]))
+              for (var a = 1; a < run.length; a++) ctx.lineTo(xOf(run[a]), yOf(run[a]))
+              ctx.lineTo(xOf(run[run.length - 1]), topPad + plotH)
+              ctx.lineTo(xOf(run[0]), topPad + plotH)
+              ctx.closePath()
+              ctx.fillStyle = grad
+              ctx.fill()
+            }
+
+            // Crisp 2px line on top, one stroke per run.
+            ctx.strokeStyle = root.accent
+            ctx.lineWidth = 2
+            ctx.lineJoin = "round"
+            ctx.lineCap = "round"
+            for (var s2 = 0; s2 < runs.length; s2++) {
+              var rn = runs[s2]
+              if (rn.length < 2) continue
+              ctx.beginPath()
+              ctx.moveTo(xOf(rn[0]), yOf(rn[0]))
+              for (var b = 1; b < rn.length; b++) ctx.lineTo(xOf(rn[b]), yOf(rn[b]))
+              ctx.stroke()
+            }
+
+            // A lone sample (app seen once, e.g. just started) has no line to
+            // draw, so mark it as a dot rather than rendering nothing.
+            for (var t2 = 0; t2 < runs.length; t2++) {
+              if (runs[t2].length !== 1) continue
+              ctx.fillStyle = root.accent
+              ctx.beginPath()
+              ctx.arc(xOf(runs[t2][0]), yOf(runs[t2][0]), 2.5, 0, Math.PI * 2)
+              ctx.fill()
+            }
+
+            // Dot on the newest sample, so "where it is now" is unambiguous.
+            var last = pts[pts.length - 1]
+            ctx.fillStyle = root.accent
+            ctx.beginPath()
+            ctx.arc(xOf(last), yOf(last), 2.5, 0, Math.PI * 2)
+            ctx.fill()
+
+            // Ring on the peak, so a spike is findable without reading the caption.
+            if (mx > 0) {
+              var pi = 0
+              for (var q = 1; q < pts.length; q++) if (pts[q].v > pts[pi].v) pi = q
+              ctx.strokeStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.55)
+              ctx.lineWidth = 1
+              ctx.beginPath()
+              ctx.arc(xOf(pts[pi]), yOf(pts[pi]), 3, 0, Math.PI * 2)
+              ctx.stroke()
+            }
+          }
+        }
+      }
+
+      Text {
+        width: parent.width
+        visible: dp.stampLine() !== ""
+        text: dp.stampLine()
+        color: root.dim2
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+
+      Text {
+        width: parent.width
+        visible: dp.netLine() !== ""
+        text: dp.netLine()
+        color: root.dim1
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+
+      Column {
+        width: parent.width
+        visible: !!dp.app && (root.procDetail.length > 0 || root.procDetailBusy)
+        spacing: Style.space(4)
+
+        Rectangle {
+          id: procHeader
+          width: parent.width
+          height: Style.space(22)
+          radius: Style.space(11)
+          color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.10)
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            preventStealing: true
+            onPressed: {}
+            onClicked: {
+              dp.procOpen = !dp.procOpen
+              if (!dp.procOpen) dp.procShowAll = false
+              dpScroll.contentY = Math.max(0, procHeader.mapToItem(dpInfo, 0, 0).y - Style.space(4))
+            }
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: (dp.procOpen ? "\uf078  " : "\uf054  ")
+                  + "Running processes (" + root.procDetail.length + ")"
+              color: root.dim1
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+        }
+
+        Text {
+          visible: root.procDetailBusy && root.procDetail.length === 0
+          text: "Scanning live processes…"
+          color: root.dim2
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Repeater {
+          visible: dp.procOpen
+          model: dp.procOpen ? dp.procShown() : []
+          delegate: Rectangle {
+            id: dpProcRow
+            width: dpInfo.width
+            height: Style.space(50)
+            radius: Style.cornerRadius
+            // Flat at rest like the app rows; only hover adds a tint.
+            color: dpProcHover.containsMouse
+                   ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.11)
+                   : "transparent"
+            Behavior on color { ColorAnimation { duration: 60 } }
+            MouseArea {
+              id: dpProcHover
+              anchors.fill: parent
+              hoverEnabled: true
+              acceptedButtons: Qt.LeftButton
+              cursorShape: root.procOpenPath(modelData) !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor
+              preventStealing: true
+              // Click reveals the binary with the desktop's default handler.
+              onClicked: {
+                if (dp.procOpenPath(modelData) !== "") {
+                  root.revealPath(dp.procOpenPath(modelData))
+                  dp.lastRevealed = modelData.pid
+                  revealTimer.restart()
+                }
+              }
+            }
+
+            // Line 1 — identity on the left, the numbers that matter on the
+            // right. The previous layout chained seven unconstrained Texts in a
+            // Row, so they overflowed the panel and the last one was clipped
+            // mid-word (elide does nothing without a constrained width).
+            Item {
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(7)
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              height: Style.space(16)
+
+              Text {
+                id: dpPid
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "#" + modelData.pid
+                color: root.fg
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+              Rectangle {
+                id: dpStateChip
+                anchors.left: dpPid.right
+                anchors.leftMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.max(Style.space(44), dpStateText.implicitWidth + Style.space(12))
+                height: Style.space(15)
+                radius: height / 2
+                color: modelData.state === "Z"
+                       ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.14)
+                       : Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.12)
+                Text {
+                  id: dpStateText
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: modelData.state_label
+                  color: modelData.state === "Z" ? root.urgent : root.dim1
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+              Text {
+                anchors.left: dpStateChip.right
+                anchors.leftMargin: Style.space(6)
+                anchors.right: dpMetrics.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: modelData.user
+                color: root.dim1
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+              // Right-aligned figures: uptime · memory · cpu, most action-relevant
+              // last. Width is bounded so nothing can spill past the row.
+              Row {
+                id: dpMetrics
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(8)
+                Text {
+                  visible: modelData.elapsed_s > 0
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "up " + root.fmtDur(modelData.elapsed_s)
+                  color: root.dim2
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                Text {
+                  visible: modelData.rss_mb > 0
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.rss_mb + " MB"
+                  color: root.dim2
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                Text {
+                  visible: modelData.cpu_s > 0
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: (modelData.cpu_s >= 10 ? Math.round(modelData.cpu_s) : modelData.cpu_s) + "s cpu"
+                  color: root.dim2
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+              }
+            }
+
+            // Line 2 — the full command line, elided against the real row width, with a
+            // brief "Opened" confirmation pinned to the right of the same line.
+            Item {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(27)
+              height: Style.space(14)
+
+              Text {
+                id: dpProcCmd
+                anchors.left: parent.left
+                anchors.right: dpReveal.visible ? dpReveal.left : parent.right
+                anchors.rightMargin: dpReveal.visible ? Style.space(6) : 0
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: modelData.cmdline
+                // Tints and underlines on hover so the row reads as clickable
+                // (clicking opens this binary with the desktop default handler).
+                color: dpProcHover.containsMouse && dpProcOpenPath(modelData) !== ""
+                       ? root.accent : root.dim2
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.underline: dpProcHover.containsMouse && dpProcOpenPath(modelData) !== ""
+                elide: Text.ElideRight
+              }
+
+              Text {
+                id: dpReveal
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                visible: dp.lastRevealed === modelData.pid
+                         && dpProcOpenPath(modelData) !== ""
+                text: "\uf00c  Opened"
+                color: root.ok
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+
+            // Line 3 — only the extras that did not fit above (threads, unit).
+            Text {
+              visible: (modelData.threads > 1 || (modelData.unit !== "" && modelData.unit))
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(41)
+              textFormat: Text.PlainText
+              text: {
+                var extra = []
+                if (modelData.threads > 1) extra.push(modelData.threads + " threads")
+                if (modelData.unit) extra.push(modelData.unit)
+                return extra.join("   ·   ")
+              }
+              color: root.dim2
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+        }
+
+        Rectangle {
+          width: parent.width
+          height: Style.space(22)
+          radius: Style.space(11)
+          visible: dp.procOpen && !dp.procShowAll && dp.procMore() > 0
+          color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.08)
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            preventStealing: true
+            onClicked: dp.procShowAll = true
+            Text {
+              anchors.centerIn: parent
+              text: "+ " + dp.procMore() + " more instance(s)"
+              color: root.dim2
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+      }
+
+      // Collapsible glossary. Reference material, so it stays out of the way
+      // until asked for — it used to occupy roughly half the panel.
+      Rectangle {
+        width: parent.width
+        height: Style.space(24)
+        radius: Style.space(12)
+        visible: dp.statLegend().length > 0
+        color: legendHover.containsMouse
+               ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.14)
+               : "transparent"
+        Behavior on color { ColorAnimation { duration: 60 } }
+        MouseArea {
+          id: legendHover
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          preventStealing: true
+          onClicked: {
+            dp.legendOpen = !dp.legendOpen
+            if (!dp.legendOpen) dpScroll.contentY = Math.max(0, legendToggle.mapToItem(dpInfo, 0, 0).y - Style.space(4))
+          }
+        }
+        Row {
+          id: legendToggle
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(6)
+          Text {
+            text: dp.legendOpen ? "\uf078  " : "\uf054  "
+            color: root.dim2
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            text: "How to read the values"
+            color: root.dim1
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+        }
+      }
+      Repeater {
+        model: dp.legendOpen ? dp.statLegend() : []
+        delegate: Row {
+          width: parent.width
+          spacing: Style.space(6)
+          Text {
+            width: Style.space(82)
+            text: modelData.h
+            color: root.dim1
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+          Text {
+            width: parent.width - Style.space(88)
+            text: modelData.d
+            color: root.dim2
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+      }
+    }
+  }
+    Row {
+      id: dpChips
+      anchors.bottom: parent.bottom
+      anchors.bottomMargin: Style.space(10)
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(12)
+      spacing: Style.space(6)
+      ActionChip {
+        visible: !!(dp.app && dp.app.pids && dp.app.pids.length > 0)
+        label: "Terminate"
+        danger: true
+        onChosen: { dp.kill(dp.app.name); dp.close() }
+      }
+      ActionChip {
+        label: (dp.app && dp.app.disabled) ? "Enable" : "Disable"
+        onChosen: {
+          if (dp.app && dp.app.disabled) dp.enable(dp.app.name)
+          else dp.disable(dp.app.name)
+        }
+      }
+      ActionChip { label: "Close"; onChosen: dp.close() }
+    }
+  }
+
+  component ConfirmBar: Item {
+    id: cb
+    property var pending: []
+    signal yes(string name)
+    signal no()
+    width: parent ? parent.width : 0
+    implicitHeight: Style.space(0)
+    visible: false
+
+    function show(name) {
+      cb.pending = [name]
+      cb.visible = true
+      cb.implicitHeight = Style.space(40)
+    }
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.space(12)
+      color: Qt.rgba(root.surface.r, root.surface.g, root.surface.b, 0.97)
+      border.width: 1
+      border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.55)
+    }
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      text: "Disable '" + ((cb.pending && cb.pending[0]) || "") + "'? It will be killed now and blocked every time it starts. Use Enable later to undo."
+      color: root.fg
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+    Row {
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(6)
+      ActionChip {
+        label: "Yes, disable"
+        danger: true
+        onChosen: {
+          var nm = (cb.pending && cb.pending[0]) || ""
+          cb.visible = false; cb.implicitHeight = Style.space(0)
+          cb.yes(nm)
+        }
+      }
+      ActionChip {
+        label: "Cancel"
+        onChosen: { cb.visible = false; cb.implicitHeight = Style.space(0); cb.no() }
+      }
+    }
+  }
+
+  component ColHeader: Item {
+    id: ch
+    property string leftLabel: "PROCESS"
+    property string midLabel: "TRUST"
+    height: Style.space(16)
+    width: parent ? parent.width : 0
+
+    Rectangle {
+      anchors.bottom: parent.bottom
+      anchors.left: parent.left
+      anchors.right: parent.right
+      height: 1
+      color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.25)
+    }
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      text: ch.leftLabel
+      color: root.dim2
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.subtitle
+      font.bold: true
+    }
+    // TRUST is LEFT-aligned to the leading edge of the same chip slot the rows
+    // use, so the header sits directly over the chips.
+    Text {
+      visible: ch.midLabel !== ""
+      anchors.left: parent.left
+      anchors.leftMargin: Math.max(Style.space(10),
+                                   ch.width - root.trustInset - root.chipSlotW)
+      anchors.verticalCenter: parent.verticalCenter
+      text: ch.midLabel
+      color: root.dim2
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.subtitle
+      font.bold: true
+    }
+    // Right columns are generated from the shared `root.procColumns` model, so
+    // each label sits exactly over the matching data cell in ProcRow/AppRow.
+    Repeater {
+      model: root.procColumns
+      delegate: Text {
+        anchors.right: parent.right
+        anchors.rightMargin: modelData.right
+        anchors.verticalCenter: parent.verticalCenter
+        width: modelData.width
+        horizontalAlignment: Text.AlignHCenter
+        text: modelData.label
+        color: root.dim2
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.subtitle
+        font.bold: true
+      }
+    }
+  }
+
+  component ProcRow: Item {
+    id: pr
+    property string name: ""
+    property string publisher: ""
+    property string desc: ""
+    property int pid: 0
+    property real cpu: 0
+    property real mem: 0
+    property real io: 0
+    property real gpu: 0
+    property real net: -1
+    property bool verified: false
+    property var perms: []
+    property int instances: 1
+    property bool disabled: false
+    property var sparks: []
+    property bool critical: cpu > 80
+    property bool hovered: false
+    // AppControl's secondary line, fed from the same snapshot fields the apps
+    // inventory already exposes.
+    readonly property string prSub: pr.publisher || pr.desc || ""
+    signal details()
+    signal kill(string name)
+    signal disable(string name)
+    signal enable(string name)
+    // Tied to root.procRowH so the fixed-height list math stays exact.
+    implicitHeight: root.procRowH
+    width: parent ? parent.width : 0
+
+    BorderSurface {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      // Flat at rest (AppControl separates rows with whitespace, not borders);
+      // the tint is reserved for the meaningful "running hot" state and hover.
+      color: pr.critical
+          ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, pr.hovered ? 0.16 : 0.10)
+          : (pr.hovered ? Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.11) : "transparent")
+      borderSpec: pr.critical
+          ? Border.flat(Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.35), 1)
+          : (pr.hovered
+              ? Border.flat(Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.3), 1)
+              : (pr.disabled
+                  ? Border.flat(Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.18), 1)
+                  : Border.none()))
+      Behavior on color { ColorAnimation { duration: 60 } }
+    }
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: pr.hovered = true
+      onExited: pr.hovered = false
+      onClicked: pr.details()
+    }
+    // Monogram avatar, matching AppRow, so the process list and the app list read
+      // as the same family of rows.
+      Rectangle {
+        id: prAvatar
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.rowAvatarSize
+        height: width
+        radius: width / 2
+        color: pr.verified ? root.ok : root.avatarColor(pr.name)
+        Text {
+          anchors.centerIn: parent
+          textFormat: Text.PlainText
+          text: pr.name.length > 0 ? pr.name.charAt(0).toUpperCase() : "?"
+          color: root.onColor(pr.verified ? root.ok : root.avatarColor(pr.name))
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+        }
+      }
+
+      // Two-tone hierarchy, AppControl-style: bold name with a muted secondary
+      // line beneath it. Bounded on BOTH sides — left at the row lead, right at
+      // the chip slot's leading edge — so a long process name elides instead of
+      // running underneath the trust chips.
+      Column {
+        anchors.left: parent.left
+        anchors.leftMargin: root.rowLead
+        anchors.right: prTagSlot.left
+        anchors.rightMargin: root.nameGap
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: 1
+
+        Text {
+          id: prName
+          width: parent.width
+          elide: Text.ElideRight
+          textFormat: Text.PlainText
+          text: pr.critical ? "\uf071  " + pr.name : pr.name
+          // Load is signalled by the row tint and the CPU pill, not the name, so
+          // a verified process never reads as "red/untrusted" just for running hot.
+          color: root.fg
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.subtitle
+          font.bold: pr.critical
+        }
+        Text {
+          visible: pr.prSub !== ""
+          width: parent.width
+          elide: Text.ElideRight
+          textFormat: Text.PlainText
+          text: pr.prSub
+          color: root.muted
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+      // Fixed-width chip slot pinned to the right edge, with the chips
+      // LEFT-aligned inside it. Every row's first chip therefore starts at the
+      // same x (a clean column) and extra chips ("×4", Cam/Mic) grow rightward
+      // into the reserved headroom instead of shifting the whole set left.
+      Item {
+        id: prTagSlot
+        anchors.right: parent.right
+        anchors.rightMargin: root.trustInset
+        anchors.verticalCenter: parent.verticalCenter
+        width: root.chipSlotW
+        height: Style.space(16)
+        Row {
+          id: prTags
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(4)
+      Rectangle {
+        visible: pr.disabled
+        width: pr.disabled ? prDisTxt.implicitWidth + Style.space(10) : 0
+        height: Style.space(14)
+        radius: Style.space(7)
+        color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.14)
+        Text {
+          id: prDisTxt
+          anchors.centerIn: parent
+          text: "\uf05e Disabled"
+          color: root.dim1
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+      Rectangle {
+        visible: pr.verified
+        width: pr.verified ? root.trustChipW : 0
+        height: root.trustChipH
+        radius: root.trustChipR
+        // Solid, high-contrast green so the trusted state stays legible even
+        // when the row itself is tinted red for high CPU.
+        color: root.ok
+        border.width: 0
+        Text {
+          id: prVerTxt
+          anchors.centerIn: parent
+          text: "\uf058  Verified"
+          color: root.onColor(root.ok)
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+      }
+      Rectangle {
+        visible: !pr.verified
+        // Identical geometry, weight and icon to the Verified badge above; only
+        // the palette differs. Unsigned used to be 2px shorter, unbold, tighter
+        // and icon-less, which made it look like a different, smaller badge.
+        width: !pr.verified ? root.trustChipW : 0
+        height: root.trustChipH
+        radius: root.trustChipR
+        color: root.warnSoft
+        border.width: 1
+        border.color: Qt.rgba(root.warn.r, root.warn.g, root.warn.b, 0.45)
+        Text {
+          id: prUnsTxt
+          anchors.centerIn: parent
+          text: "\uf071  Unsigned"
+          color: root.warn
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+      }
+      Repeater {
+        model: pr.perms
+        delegate: Rectangle {
+          width: modelData === "camera" ? Style.space(40) : (modelData === "mic" ? Style.space(30) : Style.space(52))
+          height: Style.space(14)
+          radius: Style.space(7)
+          color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.10)
+          border.width: 1
+          border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.4)
+          Text {
+            anchors.centerIn: parent
+            text: modelData === "camera" ? "Cam" : (modelData === "mic" ? "Mic" : modelData)
+            color: root.urgent
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+      Rectangle {
+        visible: pr.instances > 1
+        width: pr.instances > 1 ? Style.space(20) : 0
+        height: Style.space(14)
+        radius: Style.space(7)
+        color: Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.10)
+        Text {
+          anchors.centerIn: parent
+          text: "×" + pr.instances
+          color: root.dim1
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+      }
+    }
+    Sparkline {
+      anchors.right: parent.right
+      anchors.rightMargin: root.colRight("trend")
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.colWidth("trend")
+      height: Style.space(14)
+      data: pr.sparks
+    }
+    Text {
+      anchors.right: parent.right
+      anchors.rightMargin: root.colRight("pid")
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.colWidth("pid")
+      horizontalAlignment: Text.AlignHCenter
+      text: pr.pid > 0 ? String(pr.pid) : ""
+      color: root.dim1
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Text {
+      anchors.right: parent.right
+      anchors.rightMargin: root.colRight("net")
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.colWidth("net")
+      horizontalAlignment: Text.AlignHCenter
+      text: root.fmtNet(pr.net >= 0 ? pr.net
+          : (root.sample.net_rx_kbs || 0) + (root.sample.net_tx_kbs || 0))
+      color: root.dim1
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Text {
+      anchors.right: parent.right
+      anchors.rightMargin: root.colRight("disk")
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.colWidth("disk")
+      horizontalAlignment: Text.AlignHCenter
+      text: root.fmtNet(pr.io)
+      color: root.dim1
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Text {
+      anchors.right: parent.right
+      anchors.rightMargin: root.colRight("gpu")
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.colWidth("gpu")
+      horizontalAlignment: Text.AlignHCenter
+      text: Math.round(pr.gpu) + "%"
+      color: root.dim1
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Text {
+      anchors.right: parent.right
+      anchors.rightMargin: root.colRight("mem")
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.colWidth("mem")
+      horizontalAlignment: Text.AlignHCenter
+      text: Math.round(pr.mem) + "%"
+      color: root.dim1
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Rectangle {
+      id: prCpu
+      anchors.right: parent.right
+      anchors.rightMargin: root.colRight("cpu")
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.colWidth("cpu")
+      height: Style.space(16)
+      radius: Style.space(8)
+      color: pr.critical ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.14)
+                         : Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.10)
+      Text {
+        anchors.centerIn: parent
+        text: Math.round(pr.cpu) + "%"
+        color: pr.critical ? root.urgent : root.fg
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+    }
+  }
+
+  component Sparkline: Canvas {
+    id: spk
+    property var data: []
+    onDataChanged: requestPaint()
+    onWidthChanged: requestPaint()
+    onPaint: {
+      var ctx = getContext("2d")
+      ctx.reset()
+      var w = width, h = height
+      var maxV = 1
+      for (var i = 0; i < data.length; i++) if (data[i] > maxV) maxV = data[i]
+      ctx.beginPath()
+      for (var j = 0; j < data.length; j++) {
+        var x = j * w / Math.max(1, data.length - 1)
+        var v = data[j] < 0 ? 0 : data[j] / maxV
+        var y = h - v * (h - 2) - 1
+        if (j === 0) ctx.moveTo(x, y)
+        else ctx.lineTo(x, y)
+      }
+      // Close the path down to the baseline and fill it with an accent gradient,
+      // giving the AppControl-style filled mini-chart, then re-stroke the crisp
+      // line on top (the fill pass must not become the outline).
+      ctx.lineTo(w, h)
+      ctx.lineTo(0, h)
+      ctx.closePath()
+      var grad = ctx.createLinearGradient(0, 0, 0, h)
+      grad.addColorStop(0, Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.28))
+      grad.addColorStop(1, Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.0))
+      ctx.fillStyle = grad
+      ctx.fill()
+      // Re-trace just the line (no baseline) for a clean 1px stroke.
+      ctx.beginPath()
+      for (var k = 0; k < data.length; k++) {
+        var lx = k * w / Math.max(1, data.length - 1)
+        var lv = data[k] < 0 ? 0 : data[k] / maxV
+        var ly = h - lv * (h - 2) - 1
+        if (k === 0) ctx.moveTo(lx, ly)
+        else ctx.lineTo(lx, ly)
+      }
+      ctx.strokeStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.85)
+      ctx.lineWidth = 1
+      ctx.stroke()
+    }
+  }
+
+  // ---- History graph with time-domain zoom/pan/scrub + hover + drill.
+  component HistoryGraph: Canvas {
+    id: hg
+    property var pts: []
+    property var events: []
+    property color lineColor: root.accent
+    property color dangerColor: root.urgent
+    property real dangerThreshold: -1
+    property int maxValue: 100
+    property string unit: "%"
+    property int windowSecs: 3600
+    signal drilled(var ts)
+
+    property real viewStart: -1
+    property real viewEnd: -1
+    readonly property bool zoomed: viewStart >= 0 && viewEnd > viewStart
+    readonly property real minZoomSpan: 15
+
+    // ---- Live tail -------------------------------------------------------
+    // The time domain ends at the wall clock rather than at the newest sample,
+    // so the plot translates continuously instead of jumping once per sample.
+    //
+    // Date.now() is NOT a QML dependency: a binding on it alone would freeze the
+    // instant the data stopped changing. heartbeat is read here purely to register
+    // that dependency — its animation rewrites the property every frame, so the
+    // binding re-evaluates at frame rate, while the VALUE comes straight from the
+    // wall clock. Same workaround as BarWidget's clockSec, but per-frame.
+    //
+    // Do NOT derive the fraction from the animation instead, i.e. do not write
+    // Math.floor(Date.now()/1000) + heartbeat. It looks equivalent but is wrong:
+    // an infinite NumberAnimation restarts at `from` each cycle, and Qt's frame
+    // timer drifts against real second boundaries, so the phase would snap back
+    // by up to a second every cycle and the domain would sawtooth instead of
+    // gliding. Reading the clock for the value makes drift impossible.
+    property real heartbeat: 0
+    NumberAnimation on heartbeat {
+      from: 0
+      to: 1
+      duration: 1000
+      loops: Animation.Infinite
+      // Stop while zoomed (the view is pinned to a chosen range) and whenever the
+      // graph isn't actually on screen. NB: hg.visible is NOT usable here — Item.visible
+      // reports only the locally-set value, and this graph has none, so it stays true
+      // even when the Activity page's `visible: root.activeTab === 0` is false. Test the
+      // real condition instead, or the loop repaints two hidden canvases at 60Hz forever.
+      running: !hg.zoomed && root.open && root.activeTab === 0
+    }
+    readonly property real liveNow: {
+      var tick = heartbeat   // read for dependency tracking only
+      return Date.now() / 1000
+    }
+
+    // Plot padding is shared by drawing and hit-testing. timeAtX() inverts the
+    // same mapping onPaint uses, and it used to work off the full width and
+    // ignore these 8px pads — a miss of up to ~12 minutes at the right edge of
+    // the 24h view, which is exactly where a live graph draws the eye (and where
+    // every tooltip and drill-down reads its timestamp from).
+    readonly property real leftPad: 8
+    readonly property real rightPad: 8
+    readonly property real plotW: Math.max(10, width - leftPad - rightPad)
+
+    // How far the live domain may outrun the newest sample. Healthy lag is one
+    // poll + roll-cache interval (a few tens of seconds); without a ceiling, a
+    // suspended machine or a stalled collector would slide every point off the
+    // left edge and the chart would render empty until an hour of fresh data
+    // accumulated.
+    readonly property real maxLiveGap: 120
+
+    onWindowSecsChanged: resetView()
+    onPtsChanged: requestPaint()
+    onEventsChanged: requestPaint()
+    onWidthChanged: requestPaint()
+    onHeightChanged: requestPaint()
+    // The domain now advances on its own every frame while live, so these two
+    // are the handlers that actually drive the scroll. Without them the plot
+    // would only ever repaint when a new sample happened to land.
+    onDomStartChanged: requestPaint()
+    onDomEndChanged: requestPaint()
+
+    function resetView() { viewStart = -1; viewEnd = -1; requestPaint() }
+
+    function dataStart() { return hg.pts.length ? hg.pts[0].ts : 0 }
+    function dataEnd() { return hg.pts.length ? hg.pts[hg.pts.length - 1].ts : 0 }
+    // Ends at the wall clock, but never behind the data: if the clock reads
+    // earlier than the newest sample (clock skew, a suspended machine) the max()
+    // keeps that sample inside the view instead of scrolling it off the right edge.
+    // Reading liveNow here is what puts it inside domEnd's binding dependency set,
+    // so every heartbeat frame re-evaluates domEnd -> onDomEndChanged ->
+    // requestPaint(). That chain is what makes the graph glide.
+    // The maxLiveGap ceiling keeps a stalled collector (or a clock jump after
+    // resume) from scrolling the whole plot out of view: past the ceiling the
+    // domain freezes at dataEnd + maxLiveGap instead of chasing "now".
+    function fullEnd() {
+      var de = hg.dataEnd()
+      if (de <= 0) return hg.liveNow
+      return Math.max(de, Math.min(hg.liveNow, de + hg.maxLiveGap))
+    }
+    function fullStart() {
+      var de = hg.fullEnd()
+      if (de <= 0) return Math.floor(Date.now() / 1000) - hg.windowSecs
+      var fs = de - hg.windowSecs
+      var ds = hg.dataStart()
+      return ds > fs ? ds : fs
+    }
+    function domainStart() { return hg.zoomed ? hg.viewStart : hg.fullStart() }
+    function domainEnd() { return hg.zoomed ? hg.viewEnd : hg.fullEnd() }
+
+    // Property-backed forms of domainStart()/domainEnd() so external bindings
+    // (e.g. the temperature strip) re-evaluate on zoom/pan instead of calling
+    // the functions (function calls aren't tracked by the binding engine).
+    // These also carry the live scroll out to the temperature strip for free.
+    readonly property real domStart: hg.zoomed ? hg.viewStart : hg.fullStart()
+    readonly property real domEnd: hg.zoomed ? hg.viewEnd : hg.fullEnd()
+
+    function timeAtX(x) {
+      var s = hg.domainStart(), e = hg.domainEnd()
+      return s + (e - s) * (x - hg.leftPad) / hg.plotW
+    }
+
+    function panBy(seconds) {
+      var span = hg.viewEnd - hg.viewStart
+      var fs = hg.fullStart(), fe = hg.fullEnd()
+      var ns = hg.viewStart + seconds
+      if (ns < fs) ns = fs
+      if (ns > fe - span) ns = fe - span
+      if (ns < fs) ns = fs
+      hg.viewStart = ns
+      hg.viewEnd = ns + span
+      hg.requestPaint()
+    }
+
+    function zoomTo(t1, t2) {
+      if (t2 < t1) { var t = t1; t1 = t2; t2 = t }
+      var span = t2 - t1
+      if (span < hg.minZoomSpan) {
+        var c = (t1 + t2) / 2
+        t1 = c - hg.minZoomSpan / 2
+        t2 = c + hg.minZoomSpan / 2
+        span = hg.minZoomSpan
+      }
+      var fs = hg.fullStart(), fe = hg.fullEnd()
+      if (t1 < fs) { t1 = fs; t2 = t1 + span }
+      if (t2 > fe) { t2 = fe; t1 = t2 - span }
+      if (t1 < fs) t1 = fs
+      hg.viewStart = t1
+      hg.viewEnd = Math.max(t1 + 1, t2)
+      hg.requestPaint()
+    }
+
+    function wheelZoom(x, up) {
+      var fs = hg.fullStart(), fe = hg.fullEnd()
+      var fullSpan = fe - fs
+      if (fullSpan <= 0) return
+      var span = hg.domainEnd() - hg.domainStart()
+      var f = up ? 0.75 : 1.3333
+      var ns = Math.max(hg.minZoomSpan, Math.min(Math.max(fullSpan, hg.minZoomSpan), span * f))
+      var t = hg.timeAtX(x)
+      var frac = span > 0 ? (t - hg.domainStart()) / span : 0.5
+      var nStart = t - frac * ns
+      if (nStart < fs) nStart = fs
+      if (nStart > fe - ns) nStart = fe - ns
+      if (nStart < fs) nStart = fs
+      hg.viewStart = nStart
+      hg.viewEnd = nStart + ns
+      hg.requestPaint()
+    }
+
+    onPaint: {
+      var ctx = getContext("2d")
+      ctx.reset()
+      var w = width, h = height
+      // topPad only needs to clear the topmost y-axis label. The event markers sit
+      // just INSIDE the plot with their guide running continuously down to the
+      // curve — an earlier version floated the dot above the top gridline and
+      // started the guide below it, which left a visible gap at the axis.
+      var topPad = 8, bottomPad = 18
+      var leftPad = hg.leftPad, rightPad = hg.rightPad
+      var plotW = hg.plotW
+      var plotH = Math.max(10, h - bottomPad - topPad)
+      // Read the domain ONCE per repaint. onPaint used to call domainStart()
+      // inside every point loop, which meant several thousand Date.now() calls
+      // per frame at 60Hz, and meant ds / spanT / the axis labels / the event
+      // markers could each be taken from a slightly different instant — which
+      // quietly breaks the assumption that x is a function of a single span.
+      var sT = hg.domainStart(), eT = hg.domainEnd()
+      var spanT = Math.max(1, eT - sT)
+      var yMax = hg.maxValue > 0 ? hg.maxValue : 10
+      if (hg.maxValue < 0) {
+        var mx = 0
+        for (var i = 0; i < hg.pts.length; i++) if (hg.pts[i].v > mx) mx = hg.pts[i].v
+        yMax = Math.max(10, mx * 1.15)
+      }
+
+      ctx.strokeStyle = Qt.rgba(root.dim1.r, root.dim1.g, root.dim1.b, 0.09)
+      ctx.lineWidth = 1
+      var steps = 4
+      for (var gi = 0; gi <= steps; gi++) {
+        var gv = yMax * gi / steps
+        var gy = topPad + plotH - gv / yMax * plotH
+        ctx.beginPath()
+        ctx.moveTo(leftPad, gy + 0.5)
+        ctx.lineTo(w - rightPad, gy + 0.5)
+        ctx.stroke()
+        ctx.fillStyle = root.dim2
+        ctx.font = "9px " + root.contentFontFamily
+        ctx.textAlign = "right"
+        ctx.fillText(gv < 10 ? ("" + (gv % 1 !== 0 ? gv.toFixed(1) : Math.round(gv))) : ("" + Math.round(gv)), w - rightPad - 2, gy - 2)
+      }
+
+      ctx.fillStyle = root.dim2
+      ctx.textAlign = "center"
+      var xTicks = 4
+      for (var xi = 0; xi <= xTicks; xi++) {
+        var t = sT + spanT * xi / xTicks
+        var tx = leftPad + plotW * xi / xTicks
+        var label = hg.windowSecs >= 86400
+            ? Qt.formatDateTime(new Date(t * 1000), "dd/MM HH:mm")
+            : Qt.formatTime(new Date(t * 1000), "HH:mm")
+        ctx.fillText(label, tx, h - 4)
+      }
+
+      if (hg.pts.length < 2) return
+
+      // Subtle gradient fill under the curve (own closed path, so the stroke
+      // below stays a crisp single line instead of a filled outline).
+      ctx.beginPath()
+      var fStarted = false
+      var lastFillX = leftPad
+      for (var fi = 0; fi < hg.pts.length; fi++) {
+        var fp = hg.pts[fi]
+        var fX = leftPad + (fp.ts - sT) / spanT * plotW
+        var fY = topPad + plotH - Math.max(0, Math.min(yMax, fp.v)) / yMax * plotH
+        lastFillX = fX
+        if (!fStarted) { ctx.moveTo(fX, fY); fStarted = true }
+        else ctx.lineTo(fX, fY)
+      }
+      // Close at the LAST DATA POINT, not the right edge. The domain now ends at
+      // the wall clock, so there is normally a trailing gap between the newest
+      // sample and the plot edge; closing at the edge would smear the gradient
+      // under that empty gap and make the curve look like it reached "now".
+      ctx.lineTo(lastFillX, topPad + plotH)
+      ctx.lineTo(leftPad, topPad + plotH)
+      ctx.closePath()
+      var grad = ctx.createLinearGradient(0, topPad, 0, topPad + plotH)
+      grad.addColorStop(0, Qt.rgba(hg.lineColor.r, hg.lineColor.g, hg.lineColor.b, 0.18))
+      grad.addColorStop(1, Qt.rgba(hg.lineColor.r, hg.lineColor.g, hg.lineColor.b, 0.0))
+      ctx.fillStyle = grad
+      ctx.fill()
+
+      // Clean single-pixel-width line overlay in accent color.
+      ctx.beginPath()
+      var started = false
+      for (var li = 0; li < hg.pts.length; li++) {
+        var lp = hg.pts[li]
+        var lX = leftPad + (lp.ts - sT) / spanT * plotW
+        var lY = topPad + plotH - Math.max(0, Math.min(yMax, lp.v)) / yMax * plotH
+        if (!started) { ctx.moveTo(lX, lY); started = true }
+        else ctx.lineTo(lX, lY)
+      }
+      ctx.strokeStyle = hg.lineColor
+      ctx.lineWidth = 2
+      ctx.lineJoin = "round"
+      ctx.lineCap = "round"
+      ctx.stroke()
+
+      // Spike highlight: any span whose values cross the danger threshold is
+      // re-stroked in the danger color (segments, not a second series).
+      if (hg.dangerThreshold > 0) {
+        ctx.strokeStyle = hg.dangerColor
+        ctx.lineWidth = 2
+        var hot = false
+        for (var di = 0; di < hg.pts.length; di++) {
+          var dpt = hg.pts[di]
+          var dX = leftPad + (dpt.ts - sT) / spanT * plotW
+          var dY = topPad + plotH - Math.max(0, Math.min(yMax, dpt.v)) / yMax * plotH
+          if (dpt.v >= hg.dangerThreshold) {
+            if (!hot) { ctx.beginPath(); ctx.moveTo(dX, dY); hot = true }
+            else ctx.lineTo(dX, dY)
+          } else if (hot) {
+            ctx.stroke()
+            hot = false
+          }
+        }
+        if (hot) ctx.stroke()
+      }
+
+      // Event markers. Previously a hard 8px diamond straddling the top axis
+      // plus a 1px guide line at 0.22 alpha — both read as a stray artifact
+      // rather than a designed element. Now each event gets:
+      //   * a vertical guide that fades out toward the curve (gradient stroke,
+      //     strongest at the top where the label sits, gone by the data), and
+      //   * a small ringed dot below the axis that reads as a precise, quiet
+      //     marker instead of a blunt shape sitting on the line.
+      if (hg.events && hg.events.length) {
+        for (var pi = 0; pi < hg.events.length; pi++) {
+          var ev2 = hg.events[pi]
+          if (ev2.ts < sT || ev2.ts > eT) continue
+          var pinX = leftPad + (ev2.ts - sT) / spanT * plotW
+          var pinVal = -1
+          for (var bi2 = 0; bi2 < hg.pts.length; bi2++) {
+            if (hg.pts[bi2].ts <= ev2.ts) pinVal = hg.pts[bi2].v
+            else {
+              if (bi2 > 0 && hg.pts[bi2].ts !== hg.pts[bi2 - 1].ts) {
+                var f2 = (ev2.ts - hg.pts[bi2 - 1].ts) / (hg.pts[bi2].ts - hg.pts[bi2 - 1].ts)
+                pinVal = hg.pts[bi2 - 1].v + f2 * (hg.pts[bi2].v - hg.pts[bi2 - 1].v)
+              } else pinVal = hg.pts[bi2].v
+              break
+            }
+          }
+          var pinCol = root.eventTypeColor(ev2.kind || ev2.type || "")
+          // Where the guide meets the curve (or the plot floor if the event
+          // predates the data).
+          var pinBase = pinVal >= 0
+              ? topPad + plotH - Math.max(0, Math.min(yMax, pinVal)) / yMax * plotH
+              : topPad + plotH - 1
+          // Guide starts at the marker itself so the dot and its trail read as one
+          // connected mark.
+          var pinTop = topPad + 8
+          var pinEnd = Math.max(pinTop, pinBase - 4)
+          // Gradient guide: opaque-ish at the marker, fading to nothing where
+          // it reaches the data, so it guides the eye instead of cutting it.
+          var guide = ctx.createLinearGradient(0, pinTop, 0, pinEnd)
+          guide.addColorStop(0, root.hexRgba(pinCol, 0.5))
+          guide.addColorStop(1, root.hexRgba(pinCol, 0.0))
+          ctx.strokeStyle = guide
+          ctx.lineWidth = 1.5
+          ctx.beginPath()
+          ctx.moveTo(pinX, pinTop)
+          ctx.lineTo(pinX, pinEnd)
+          ctx.stroke()
+          // Ringed dot marker at the head of its own guide, inside the plot.
+          var mY = topPad + 8
+          var mR = 3
+          ctx.fillStyle = root.hexRgba(pinCol, 0.95)
+          ctx.beginPath()
+          ctx.arc(pinX, mY, mR, 0, Math.PI * 2)
+          ctx.fill()
+          // Soft outer halo for depth, then a crisp surface-coloured centre so
+          // the dot reads as a ring rather than a flat blob.
+          ctx.strokeStyle = root.hexRgba(pinCol, 0.28)
+          ctx.lineWidth = 1
+          ctx.beginPath()
+          ctx.arc(pinX, mY, mR + 2.5, 0, Math.PI * 2)
+          ctx.stroke()
+          ctx.fillStyle = root.surface
+          ctx.beginPath()
+          ctx.arc(pinX, mY, mR - 1.4, 0, Math.PI * 2)
+          ctx.fill()
+        }
+      }
+
+      // Drag-to-select band. Soft vertical gradient with brighter edges rather than
+      // a flat fill inside a hard square outline, so the selection reads as a
+      // deliberate region instead of a debugging rectangle.
+      if (dragStart >= 0 && !hg.zoomed) {
+        var bX = Math.min(dragStart, dragCur)
+        var bW = Math.abs(dragCur - dragStart)
+        if (bW > 0) {
+          var band = ctx.createLinearGradient(bX, 0, bX + bW, 0)
+          band.addColorStop(0, Qt.rgba(hg.lineColor.r, hg.lineColor.g, hg.lineColor.b, 0.16))
+          band.addColorStop(0.5, Qt.rgba(hg.lineColor.r, hg.lineColor.g, hg.lineColor.b, 0.07))
+          band.addColorStop(1, Qt.rgba(hg.lineColor.r, hg.lineColor.g, hg.lineColor.b, 0.16))
+          ctx.fillStyle = band
+          ctx.fillRect(bX, topPad, bW, plotH)
+          ctx.strokeStyle = Qt.rgba(hg.lineColor.r, hg.lineColor.g, hg.lineColor.b, 0.45)
+          ctx.lineWidth = 1
+          ctx.beginPath()
+          ctx.moveTo(bX + 0.5, topPad)
+          ctx.lineTo(bX + 0.5, topPad + plotH)
+          ctx.moveTo(bX + bW - 0.5, topPad)
+          ctx.lineTo(bX + bW - 0.5, topPad + plotH)
+          ctx.stroke()
+        }
+      }
+
+      // Zoom state pill. Rounded ends and a hairline border instead of a hard
+      // fillRect/strokeRect corner pair, matching the refined marker above.
+      if (hg.zoomed) {
+        var pillText = root.fmtTime(hg.viewStart) + " – " + root.fmtTime(hg.viewEnd) + "   ↺ reset"
+        ctx.font = "9px " + root.contentFontFamily
+        var tw = ctx.measureText(pillText).width
+        // Sits below the marker lane so it never collides with a marker dot or the
+        // top gridline value.
+        var pX = leftPad, pY = topPad + 20, pH = 17, pW = tw + 16
+        ctx.beginPath()
+        if (ctx.roundRect) {
+          ctx.roundRect(pX, pY, pW, pH, pH / 2)
+        } else {
+          ctx.moveTo(pX + pH / 2, pY)
+          ctx.arcTo(pX + pW, pY, pX + pW, pY + pH, pH / 2)
+          ctx.arcTo(pX + pW, pY + pH, pX, pY + pH, pH / 2)
+          ctx.arcTo(pX, pY + pH, pX, pY, pH / 2)
+          ctx.arcTo(pX, pY, pX + pW, pY, pH / 2)
+          ctx.closePath()
+        }
+        ctx.fillStyle = Qt.rgba(root.surface.r, root.surface.g, root.surface.b, 0.94)
+        ctx.fill()
+        ctx.strokeStyle = Qt.rgba(hg.lineColor.r, hg.lineColor.g, hg.lineColor.b, 0.45)
+        ctx.lineWidth = 1
+        ctx.stroke()
+        ctx.fillStyle = hg.lineColor
+        ctx.textAlign = "left"
+        // Centre the label in the pill rather than using fixed offsets.
+        ctx.fillText(pillText, pX + 8, pY + pH / 2 + 3)
+      }
+    }
+
+    property real dragStart: -1
+    property real dragCur: -1
+    property bool dragMoved: false
+    property real hoverPointerX: -1
+    signal rangeSelected(real t1, real t2)
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton
+      cursorShape: Qt.CrossCursor
+
+      onEntered: {
+        hg.hoverPointerX = 0
+        hg.requestPaint()
+      }
+      onExited: {
+        hg.hoverPointerX = -1
+        hg.requestPaint()
+        tip.hide()
+      }
+      onPositionChanged: function(mouse) {
+        if (hg.dragStart >= 0) {
+          if (hg.zoomed) {
+            var movedT = hg.timeAtX(mouse.x)
+            var startT = hg.timeAtX(hg.dragStart)
+            hg.panBy(movedT - startT)
+            hg.dragStart = mouse.x
+          } else {
+            if (!hg.dragMoved && Math.abs(mouse.x - hg.dragStart) >= 6) hg.dragMoved = true
+            hg.dragCur = mouse.x
+            hg.requestPaint()
+          }
+        } else {
+          hg.hoverPointerX = mouse.x
+          hg.requestPaint()
+          tip.showAt(hg.timeAtX(mouse.x), mouse.x, mouse.y)
+        }
+      }
+      onPressed: function(mouse) {
+        hg.dragStart = mouse.x
+        hg.dragCur = mouse.x
+        hg.dragMoved = false
+      }
+      onReleased: function(mouse) {
+        if (hg.dragStart < 0) return
+        var startX = hg.dragStart
+        hg.dragStart = -1
+        hg.dragCur = -1
+        if (hg.dragMoved) {
+          if (!hg.zoomed) {
+            hg.zoomTo(hg.timeAtX(startX), hg.timeAtX(mouse.x))
+            hg.rangeSelected(hg.viewStart, hg.viewEnd)
+          }
+          hg.dragMoved = false
+          hg.requestPaint()
+        } else {
+          if (hg.dataEnd() > 0) hg.drilled(hg.timeAtX(mouse.x))
+        }
+      }
+      onDoubleClicked: hg.resetView()
+      onWheel: function(wheel) {
+        hg.wheelZoom(wheel.x, wheel.angleDelta.y > 0)
+      }
+    }
+
+    // Hover tooltip. Themed via Color.tooltip.* + a BorderSurface border spec
+    // so it matches the running theme (it used to be a hardcoded dark card).
+    // Layout follows AppControl: a header row (timestamp left, value right) then
+    // a ranked list of the top processes with a dot avatar + name on the left and
+    // a bold right-aligned figure, then a muted "N others" overflow line.
+    BorderSurface {
+      id: tip
+      z: 50
+      visible: false
+      width: Style.space(250)
+      implicitHeight: tipCol.implicitHeight + Style.space(16)
+      radius: Style.cornerRadius
+      color: Color.tooltip.background
+      borderSpec: root.tipBorderSpec
+      property var tipRows: []
+      property int tipTotal: 0
+      Column {
+        id: tipCol
+        anchors.fill: parent
+        anchors.margins: Style.space(10)
+        spacing: Style.space(4)
+        // Header: timestamp left, bold value right.
+        Item {
+          width: tip.width - Style.space(20)
+          height: Math.max(tipTime.implicitHeight, tipValue.implicitHeight)
+          Text {
+            id: tipTime
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            color: Qt.rgba(Color.tooltip.text.r, Color.tooltip.text.g, Color.tooltip.text.b, 0.75)
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            id: tipValue
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            color: Color.tooltip.text
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+          }
+        }
+        // Ranked list of top processes at this moment.
+        Repeater {
+          model: tip.tipRows
+          delegate: Item {
+            required property var modelData
+            width: tip.width - Style.space(20)
+            height: Style.space(20)
+            Rectangle {
+              id: tipDot
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(14)
+              height: width
+              radius: width / 2
+              color: root.avatarColor(modelData.name)
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: modelData.name.length > 0 ? modelData.name.charAt(0).toUpperCase() : "?"
+                color: root.onColor(root.avatarColor(modelData.name))
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+            Text {
+              anchors.left: tipDot.right
+              anchors.leftMargin: Style.space(6)
+              anchors.right: tipPct.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: modelData.name
+              color: Color.tooltip.text
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+            Text {
+              id: tipPct
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: modelData.pctText
+              color: Color.tooltip.text
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+        }
+        Text {
+          id: tipMore
+          visible: tip.tipTotal > tip.tipRows.length
+          width: tip.width - Style.space(20)
+          text: tip.tipTotal > tip.tipRows.length
+              ? "Click the graph to see " + (tip.tipTotal - tip.tipRows.length) + " others"
+              : ""
+          color: Qt.rgba(Color.tooltip.text.r, Color.tooltip.text.g, Color.tooltip.text.b, 0.6)
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+        Text {
+          id: tipEvents
+          width: tip.width - Style.space(20)
+          color: root.info
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          visible: false
+        }
+      }
+      function showAt(ts, x, y) {
+        var near = null
+        for (var i = 0; i < hg.pts.length; i++) {
+          if (hg.pts[i].ts >= ts) { near = hg.pts[i]; break }
+        }
+        if (!near && hg.pts.length) near = hg.pts[hg.pts.length - 1]
+        if (!near) return
+        tipTime.text = Qt.formatDateTime(new Date(near.ts * 1000), "HH:mm:ss") + ", " + Qt.formatDate(new Date(near.ts * 1000), "d MMM")
+        tipValue.text = (root.selMetric === "disk" || root.selMetric === "net") ? Model.fmtRate(near.v)
+                        : Math.round(near.v) + hg.unit
+        var top = []
+        var total = 0
+        var sel = root.nearestSnap(near.ts)
+        if (sel && sel.procs) {
+          var arr = sel.procs.slice()
+          var tipNet = root.selMetric === "net"
+          var tipIo = root.selMetric === "disk"
+          arr.sort(function(a, b) {
+            if (tipNet) {
+              var an2 = (a.nr || 0) + (a.nt || 0)
+              var bn2 = (b.nr || 0) + (b.nt || 0)
+              if (bn2 !== an2) return bn2 - an2
+            }
+            if (tipIo) {
+              var ai2 = (a.io_kbs || 0)
+              var bi2 = (b.io_kbs || 0)
+              if (bi2 !== ai2) return bi2 - ai2
+            }
+            return b.cpu - a.cpu
+          })
+          total = arr.length
+          // Build the ranked rows (name + preformatted figure) for the Repeater.
+          var rows = []
+          for (var k = 0; k < arr.length && k < 4; k++) {
+            var p = arr[k]
+            rows.push({ name: p.name,
+                        pctText: tipNet ? Math.round((p.nr || 0) + (p.nt || 0)) + " KB/s"
+                                        : tipIo ? Math.round(p.io_kbs || 0) + " KB/s"
+                                                 : Math.round(p.cpu) + "%" })
+          }
+          top = rows
+        }
+        tip.tipRows = top
+        tip.tipTotal = total
+        // Pinned events near this moment (the 3 closest within ±5 min).
+        var pins = []
+        for (var pi = 0; pi < hg.events.length; pi++) {
+          var pe = hg.events[pi]
+          var pd = Math.abs(pe.ts - near.ts)
+          if (pd > 300) continue
+          pins.push({ d: pd, e: pe })
+        }
+        pins.sort(function(a, b) { return a.d - b.d })
+        var ptxt = ""
+        for (var q = 0; q < pins.length && q < 3; q++) {
+          var pev = pins[q].e
+          ptxt += (q > 0 ? "\n" : "") + "◆ " + Qt.formatTime(new Date(pev.ts * 1000), "HH:mm")
+              + "  " + (pev.app || pev.msg || pev.kind)
+        }
+        tipEvents.text = ptxt
+        tipEvents.visible = ptxt.length > 0
+        tip.visible = true
+        tip.parent = hg
+        tip.width = Style.space(250)
+        var px = x - tip.width / 2
+        if (px < 4) px = 4
+        if (px > hg.width - tip.width - 4) px = hg.width - tip.width - 4
+        tip.x = px
+        tip.y = y - tip.height - 22
+        if (tip.y < 4) tip.y = y + 12
+      }
+      function hide() { tip.visible = false }
+    }
+  }
+
+  // ---- Mini overview: full-history sparkline with a draggable selection band.
+  component MiniOverview: Item {
+    id: mo
+    property var pts: []
+    property var graph: null
+    // Without this the mini overview's sparkline is frozen whenever new samples
+    // arrive — its only repaint triggers were the zoom/pan Connections below, so
+    // it updated solely when you happened to scrub. On a live chart that meant the
+    // overview never actually tracked the data.
+    onPtsChanged: moCan.requestPaint()
+
+    Canvas {
+      id: moCan
+      anchors.fill: parent
+      onWidthChanged: requestPaint()
+      onHeightChanged: requestPaint()
+      onPaint: {
+        var ctx = getContext("2d")
+        ctx.reset()
+        var w = width, h = height
+        ctx.fillStyle = Qt.rgba(root.dim2.r, root.dim2.g, root.dim2.b, 0.06)
+        ctx.fillRect(0, 0, w, h)
+        if (!mo.pts.length) return
+        var mx = 0
+        for (var i = 0; i < mo.pts.length; i++) if (mo.pts[i].v > mx) mx = mo.pts[i].v
+        if (mx <= 0) return
+        ctx.beginPath()
+        for (var j = 0; j < mo.pts.length; j++) {
+          var x = j * w / Math.max(1, mo.pts.length - 1)
+          var y = h - 2 - mo.pts[j].v / mx * (h - 4)
+          if (j === 0) ctx.moveTo(x, y)
+          else ctx.lineTo(x, y)
+        }
+        ctx.strokeStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.45)
+        ctx.lineWidth = 1
+        ctx.stroke()
+
+        var g = mo.graph
+        if (!g) return
+        var fs = g.fullStart(), fe = g.fullEnd()
+        var span = Math.max(1, fe - fs)
+        var s = g.zoomed ? g.viewStart : fs
+        var e = g.zoomed ? g.viewEnd : fe
+        var bx = (s - fs) / span * w
+        var bw = (e - s) / span * w
+        ctx.fillStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+        ctx.fillRect(bx, 0, bw, h)
+        ctx.fillStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.85)
+        ctx.fillRect(bx, 0, 2, h)
+        ctx.fillRect(bx + bw - 2, 0, 2, h)
+        ctx.fillRect(bx, h - 3, bw, 3)
+      }
+    }
+    MouseArea {
+      id: moMouse
+      anchors.fill: parent
+      property int grip: 0
+      onPressed: function(mouse) {
+        var g = mo.graph
+        if (!g) return
+        var fs = g.fullStart(), fe = g.fullEnd()
+        var span = Math.max(1, fe - fs)
+        var w = width
+        var s = g.zoomed ? g.viewStart : fs
+        var e = g.zoomed ? g.viewEnd : fe
+        var bx = (s - fs) / span * w
+        var bw = (e - s) / span * w
+        grip = mouse.x < bx + 8 ? -1 : (mouse.x > bx + bw - 8 ? 1 : 0)
+      }
+      onPositionChanged: function(mouse) {
+        var g = mo.graph
+        if (!g || g.dataEnd() <= 0) return
+        var fs = g.fullStart(), fe = g.fullEnd()
+        var span = Math.max(1, fe - fs)
+        var w = width
+        var t = fs + span * mouse.x / w
+        var s = g.zoomed ? g.viewStart : fs
+        var e = g.zoomed ? g.viewEnd : fe
+        var d = e - s
+        if (grip === -1) {
+          g.viewStart = Math.min(t, e - Math.max(10, d))
+        } else if (grip === 1) {
+          g.viewEnd = Math.max(t, s + Math.max(10, d))
+        } else {
+          g.viewStart = Math.max(fs, Math.min(fe - d, t - d / 2))
+          g.viewEnd = g.viewStart + d
+        }
+        g.requestPaint()
+      }
+      onReleased: { grip = 0 }
+    }
+    Connections {
+      target: mo.graph
+      function onViewStartChanged() { moCan.requestPaint() }
+      function onViewEndChanged() { moCan.requestPaint() }
+    }
+  }
+
+  // Thin CPU/GPU temperature readout that shares the main graph's time domain,
+  // so scrubbing/zooming the chart re-scopes it automatically via graph.domStart/domEnd.
+  component TemperatureStrip: Canvas {
+    id: ts
+    property var pts: []
+    property real domainStart: -1
+    property real domainEnd: -1
+    onPtsChanged: requestPaint()
+    onDomainStartChanged: requestPaint()
+    onDomainEndChanged: requestPaint()
+    onWidthChanged: requestPaint()
+
+    onPaint: {
+      var ctx = getContext("2d")
+      ctx.reset()
+      if (ts.pts.length < 2 || ts.domainEnd <= ts.domainStart) return
+      var leftPad = 8, rightPad = 8
+      var plotW = width - leftPad - rightPad
+      var minT = 1e9, maxT = -1e9
+      for (var i = 0; i < ts.pts.length; i++) {
+        minT = Math.min(minT, ts.pts[i].ctemp, ts.pts[i].gtemp)
+        maxT = Math.max(maxT, ts.pts[i].ctemp, ts.pts[i].gtemp)
+      }
+      if (maxT <= minT) { minT -= 1; maxT += 1 }
+      var spanT = ts.domainEnd - ts.domainStart
+
+      function drawLine(key, color) {
+        ctx.beginPath()
+        var started = false
+        for (var i = 0; i < ts.pts.length; i++) {
+          var p = ts.pts[i]
+          var x = leftPad + (p.ts - ts.domainStart) / spanT * plotW
+          var y = height - 2 - (p[key] - minT) / (maxT - minT) * (height - 4)
+          if (!started) { ctx.moveTo(x, y); started = true } else ctx.lineTo(x, y)
+        }
+        ctx.strokeStyle = color
+        ctx.lineWidth = 1.5
+        ctx.stroke()
+      }
+      drawLine("ctemp", root.accent)
+      drawLine("gtemp", Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.5))
+
+      ctx.fillStyle = root.dim2
+      ctx.font = "8px " + root.contentFontFamily
+      ctx.textAlign = "right"
+      ctx.fillText(Math.round(maxT) + "°C", width - rightPad, 8)
+      ctx.fillText(Math.round(minT) + "°C", width - rightPad, height - 2)
+    }
+  }
+}
