@@ -5,7 +5,7 @@ Private backup of my Omarchy configuration, custom plugins, theme, and package l
 ## Restore on a fresh Omarchy install
 
 ```bash
-git clone git@github.com:d4vid87/omarchy-setup.git
+git clone git@github.com:d4vid87/omarchy-dotfiles.git
 cd omarchy-setup
 ./install.sh
 ```
@@ -25,7 +25,7 @@ The monitor rules describe the original four-monitor desk. Omarchy's generic
 fallback remains first, so other displays still work; edit
 `~/.config/hypr/monitors.lua` for the new hardware.
 
-Run `./update.sh` on the original computer to refresh this backup before pushing.
+A user timer refreshes this snapshot and pushes changes to the private GitHub repo every 15 minutes. Run it immediately with `systemctl --user start omarchy-dotfiles-backup.service`; check recent runs with `journalctl --user -u omarchy-dotfiles-backup.service`. Disable automatic backups with `systemctl --user disable --now omarchy-dotfiles-backup.timer`.
 
 ## Snapshot: 2026-09-22
 
