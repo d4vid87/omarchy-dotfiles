@@ -10,9 +10,10 @@ cd omarchy-dotfiles
 ./install.sh
 ```
 
-The installer backs up any replaced files under `~/.local/state/omarchy-setup/`,
-rewrites old `/home/dwm` paths to the new user's home, restores third-party
-plugins at the recorded commits, reloads Hyprland, and restarts Omarchy Shell.
+The installer backs up replaced files under `~/.local/state/omarchy-setup/`,
+rewrites old `/home/dwm` paths to the new user's home, restores saved plugin
+snapshots (using the recorded commits if a snapshot is absent), reloads Hyprland,
+and restarts Omarchy Shell.
 
 Package lists are reference snapshots. Install only what the new computer needs:
 
