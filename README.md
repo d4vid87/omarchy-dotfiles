@@ -30,11 +30,13 @@ A user timer refreshes this snapshot and pushes changes to the public GitHub rep
 
 ## Snapshot contents
 
-Includes Hyprland key bindings, terminal and shell settings, all installed Omarchy
-plugins, the Bibata-Modern-Ice-Right cursor theme, wallpapers from `~/Wallpapers`,
-Omarchy themes and active per-monitor wallpaper selections, and installed package
-lists. The installer restores `state/current` as well as configuration. Accounts,
-credentials, clipboard history, notifications, and other application data are excluded.
+Includes Hyprland key bindings, Voxtype config and user service, terminal and shell
+settings, all installed Omarchy plugins, the Bibata-Modern-Ice-Right cursor theme,
+wallpapers from `~/Wallpapers`, Omarchy themes and active per-monitor wallpaper
+selections, and installed package lists. The installer restores `state/current` as
+well as configuration and enables Voxtype if installed. Downloaded Voxtype models
+and meeting history are excluded. Accounts, credentials, clipboard history,
+notifications, and other application data are excluded.
 
 External dependencies are not bundled: the lock-screen avatar on `/run/media`,
 `~/AppImages/stormdesk.appimage`, `~/AppImages/hookecho.appimage`, and system-installed

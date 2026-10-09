@@ -2,7 +2,9 @@
 set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "$0")" && pwd)
-rsync -a --exclude='*.bak*' --exclude='*backup*' --exclude='.git' "$HOME/.config/hypr" "$HOME/.config/alacritty" "$HOME/.config/ghostty" "$HOME/.config/kitty" "$repo/config/.config/"
+rsync -a --exclude='*.bak*' --exclude='*backup*' --exclude='.git' "$HOME/.config/hypr" "$HOME/.config/alacritty" "$HOME/.config/ghostty" "$HOME/.config/kitty" "$HOME/.config/voxtype" "$repo/config/.config/"
+mkdir -p "$repo/config/.config/systemd/user"
+rsync -a "$HOME/.config/systemd/user/voxtype.service" "$repo/config/.config/systemd/user/"
 rsync -a --delete --delete-excluded --exclude='.claude' --exclude='*.bak*' --exclude='*backup*' --exclude='.git' "$HOME/.config/omarchy/" "$repo/config/.config/omarchy/"
 mkdir -p "$repo/state/current"
 rsync -a --delete "$HOME/.local/state/omarchy/current/" "$repo/state/current/"
