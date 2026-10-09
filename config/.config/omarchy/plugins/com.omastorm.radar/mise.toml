@@ -1,0 +1,106 @@
+# Repo prerequisites and the jobs. `mise install` gets the tools; `mise tasks`
+# lists the jobs and each runs as `mise <job>`. Quickshell, Qt Shader Tools,
+# socat, ImageMagick, and ffmpeg are desktop packages outside mise; `mise setup`
+# checks for them.
+
+[tools]
+rust = { version = "1.98", profile = "minimal", components = "rustfmt,clippy" }
+shellcheck = "0.11"
+jq = "1.8"
+ripgrep = "15"
+gh = "2"
+
+[tasks.setup]
+description = "Desktop package check, verified fixtures, cargo fetch, debug build"
+run = "bash scripts/dev-bootstrap.sh"
+
+[tasks.refresh-fixtures]
+description = "Download upstream fixtures and rewrite data/fixtures plus SHA256SUMS"
+run = "bash scripts/refresh-fixtures.sh"
+
+[tasks.build]
+description = "Debug engine"
+run = "cargo build --offline --locked"
+
+[tasks.format]
+description = "rustfmt, writing"
+run = "cargo fmt"
+
+[tasks.lint]
+description = "rustfmt check, clippy with warnings denied, shellcheck"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --offline --locked --all-targets -- -D warnings",
+  "shellcheck -x run.sh scripts/*.sh",
+]
+
+[tasks.start]
+description = "Launch the window against the shared debug daemon (needs GPU Quickshell)"
+run = "OMASTORM_RESCAN_PLUGIN=1 bash run.sh"
+
+[tasks.restart]
+description = "Stop the shared debug daemon, then launch this checkout's window"
+run = "bash -c 'test -x target/debug/omastorm-engine && target/debug/omastorm-engine stop || true; exec env OMASTORM_RESCAN_PLUGIN=1 bash run.sh'"
+
+[tasks.onboard]
+description = "Launch this checkout with no weather or remembered view (location picker)"
+run = "mkdir -p target && : > target/onboard-state.json && OMASTORM_LOCATION=/dev/null OMASTORM_STATE=$PWD/target/onboard-state.json OMASTORM_RESCAN_PLUGIN=1 bash run.sh"
+
+[tasks.plugin-link]
+description = "Point the Omarchy bar plugin at this checkout and enable it"
+run = "bash scripts/link-plugin.sh"
+
+[tasks.plugin-unlink]
+description = "Restore the installed Omarchy plugin clone"
+run = "bash scripts/link-plugin.sh --unlink"
+
+[tasks.stop]
+description = "End the shared debug daemon"
+run = "target/debug/omastorm-engine stop"
+
+[tasks.test]
+description = "Rust unit and socket tests"
+run = "cargo test --offline --locked"
+
+[tasks.check]
+description = "Integration suite against a scratch daemon; run before every commit (--gpu adds the rendering test)"
+run = "bash scripts/check.sh"
+
+[tasks.engine-bump]
+description = "Bump engine/Cargo.toml and Cargo.lock to the next patch (or -- <version>); publishes nothing"
+run = "bash scripts/bump-engine-version.sh"
+
+[tasks.engine-tag]
+description = "Push annotated engine-<version> from clean main so CI drafts the GitHub Release"
+run = "bash scripts/tag-engine-release.sh"
+
+[tasks.engine-verify]
+description = "Download published engine assets and require their sha256 to match the candidate pin; writes nothing"
+run = "bash scripts/pin-engine-release.sh --verify-only"
+
+[tasks.engine-pin]
+description = "Verify published engine assets, then write engine/release.pin (does not commit)"
+run = "bash scripts/pin-engine-release.sh"
+
+[tasks.build-release]
+description = "Optimized, stripped engine and SHA256SUMS under target/dist/ as a release candidate; publishes nothing (--write-pin updates engine/release.pin)"
+run = "bash scripts/build-engine-release.sh"
+
+[tasks.release]
+description = "Local fallback: publish engine-<version> from a laptop (candidate, draft, publish, verify, write pin; --dry-run, --yes)"
+run = "bash scripts/release-engine.sh"
+
+[tasks.agents-link]
+description = "Symlink the sibling wesleygrimes/agents overlay into this gitignored tree"
+run = "bash ../agents/scripts/link.sh"
+
+[tasks.agents-unlink]
+description = "Remove the wesleygrimes/agents overlay from this checkout"
+run = "bash ../agents/scripts/unlink.sh"
+
+[tasks.clean]
+description = "Remove Cargo output and scratch runtime dirs"
+run = [
+  "cargo clean",
+  "rm -rf /tmp/omastorm-check.* /tmp/omastorm-theme.*",
+]

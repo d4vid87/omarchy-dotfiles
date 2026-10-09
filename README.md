@@ -1,12 +1,12 @@
-# Omarchy setup
+# Omarchy dotfiles
 
-Private backup of my Omarchy configuration, custom plugins, theme, and package list.
+Backup of my Omarchy configuration, installed plugins, cursor theme, wallpapers, and package list.
 
 ## Restore on a fresh Omarchy install
 
 ```bash
-git clone git@github.com:d4vid87/omarchy-dotfiles.git
-cd omarchy-setup
+git clone https://github.com/d4vid87/omarchy-dotfiles.git
+cd omarchy-dotfiles
 ./install.sh
 ```
 
@@ -25,18 +25,18 @@ The monitor rules describe the original four-monitor desk. Omarchy's generic
 fallback remains first, so other displays still work; edit
 `~/.config/hypr/monitors.lua` for the new hardware.
 
-A user timer refreshes this snapshot and pushes changes to the private GitHub repo every 15 minutes. Run it immediately with `systemctl --user start omarchy-dotfiles-backup.service`; check recent runs with `journalctl --user -u omarchy-dotfiles-backup.service`. Disable automatic backups with `systemctl --user disable --now omarchy-dotfiles-backup.timer`.
+A user timer refreshes this snapshot and pushes changes to the public GitHub repo every 15 minutes. Run it immediately with `systemctl --user start omarchy-dotfiles-backup.service`; check recent runs with `journalctl --user -u omarchy-dotfiles-backup.service`. Disable automatic backups with `systemctl --user disable --now omarchy-dotfiles-backup.timer`.
 
-## Snapshot: 2026-09-22
+## Snapshot contents
 
-Includes current Hyprland, terminal and shell settings, custom plugins, six
-third-party plugin revisions, Noir and Deep Space themes, active generated theme
-and wallpaper selections, and installed package lists. The installer restores
-`state/current` as well as configuration. Accounts, credentials, clipboard history,
-notifications, and other application data are excluded.
+Includes Hyprland key bindings, terminal and shell settings, all installed Omarchy
+plugins, the Bibata-Modern-Ice-Right cursor theme, wallpapers from `~/Wallpapers`,
+Omarchy themes and active per-monitor wallpaper selections, and installed package
+lists. The installer restores `state/current` as well as configuration. Accounts,
+credentials, clipboard history, notifications, and other application data are excluded.
 
 External dependencies are not bundled: the lock-screen avatar on `/run/media`,
 `~/AppImages/stormdesk.appimage`, `~/AppImages/hookecho.appimage`, and system-installed
-fonts/icons. Restore those separately. This is a desktop configuration export,
-not a full operating-system backup. Plugin-specific state outside the current
-theme directory is not included.
+fonts. Restore those separately. This is a desktop configuration export, not a full
+operating-system backup. Plugin-specific state outside each installed plugin folder
+and the current theme directory is not included.
