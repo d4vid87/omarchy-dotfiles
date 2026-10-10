@@ -1,3 +1,4 @@
 ai-usagebar-bin
 gearlever
 hyprmoncfg-bin
+qbittorrent-enhanced
