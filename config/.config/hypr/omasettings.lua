@@ -10,3 +10,11 @@ hl.config({
   },
 })
 
+hl.config({
+  input = {
+    touchpad = {
+      scroll_factor = 1.70,
+    },
+  },
+})
+
