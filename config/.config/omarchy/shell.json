@@ -1,26 +1,13 @@
 {
   "bar": {
-    "centerAnchor": "dwm.clock",
     "layout": {
       "center": [
-        {
-          "id": "dwm.indicators"
-        },
         {
           "id": "dwm.clock",
           "fontSize": 22,
           "format": "ddd d MMM h:mm AP",
           "formatAlt": "d MMMM 'W'ww yyyy",
           "verticalFormat": "h\n—\nmm\nAP"
-        },
-        {
-          "id": "omarchy.keyboard-layout"
-        },
-        {
-          "id": "omarchy.weather"
-        },
-        {
-          "id": "omarchy.system-update"
         }
       ],
       "left": [
@@ -37,6 +24,9 @@
       "right": [
         {
           "id": "omarchy.tray"
+        },
+        {
+          "id": "omarchy.keyboard-layout"
         },
         {
           "id": "crmne.hyprmoncfg"
@@ -72,17 +62,31 @@
         {
           "id": "omarchy.power"
         }
+      ],
+      "centerBegin": [
+        {
+          "id": "dwm.indicators"
+        }
+      ],
+      "centerEnd": [
+        {
+          "id": "omarchy.elsewhen"
+        },
+        {
+          "id": "omarchy.weather"
+        },
+        {
+          "id": "omarchy.system-update"
+        }
       ]
     },
     "position": "top",
     "transparent": false
   },
   "cloneSourceRestores": [
-    "dwm.background",
     "io.github.sirjul1337.lock-explorer"
   ],
   "disabledPlugins": [
-    "omarchy.background",
     "omarchy.lock"
   ],
   "idle": {
@@ -90,9 +94,6 @@
     "screensaver": 150
   },
   "plugins": [
-    {
-      "id": "dwm.background"
-    },
     {
       "id": "dwm.alttab"
     },

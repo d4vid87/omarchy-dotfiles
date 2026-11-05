@@ -101,3 +101,9 @@ o.bind("SUPER + DOWN", "Snap window to bottom half", snap_half("d"))
 -- Super + D turns off all monitors (any key/mouse input wakes them; omarchy
 -- defaults set key_press/mouse_move_enables_dpms).
 o.bind("SUPER + D", "Screens off", hl.dsp.dpms("off"))
+
+-- Dictation keys from before Alt + Space and Right Alt became the defaults.
+-- Remove these lines to give the keys back to applications.
+if o.dictation_installed and o.dictation_installed() then
+  o.bind("SUPER + CTRL + X", "Toggle dictation", "omarchy-dictation toggle")
+end

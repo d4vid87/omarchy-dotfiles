@@ -22,12 +22,12 @@ cups
 cups-filters
 cups-pk-helper
 ddcutil
+disktree-bin
 docker
 docker-buildx
 docker-compose
 dosfstools
 dotnet-runtime
-dua-cli
 efibootmgr
 espeak-ng
 evince
@@ -36,7 +36,11 @@ expac
 eza
 fastfetch
 fcitx5
+fcitx5-chewing
+fcitx5-chinese-addons
 fcitx5-gtk
+fcitx5-hangul
+fcitx5-mozc
 fcitx5-qt
 fd
 ffmpegthumbnailer
@@ -46,6 +50,7 @@ fwupd
 fzf
 ghostty
 git
+gliff
 gnome-disk-utility
 gnome-keyring
 gnome-themes-extra
@@ -56,6 +61,7 @@ gvfs-mtp
 gvfs-nfs
 gvfs-smb
 herdr
+hype
 hyprland
 hyprland-guiutils
 hyprland-preview-share-picker
@@ -93,6 +99,7 @@ man-db
 mariadb-libs
 mise-bin
 mkinitcpio
+monologue
 moonlight-qt
 mosquitto
 mpv
@@ -112,11 +119,16 @@ obsidian
 omacalc
 omacut
 omarchy
+omarchy-hyprland-titlebars
 omarchy-keyring
 omarchy-nvim
+omarchy-power-profiles-daemon
 omarchy-settings
+omasnap
 omawrite
 openai-codex-desktop
+owe
+owe-lockfeed
 pacman-contrib
 pamixer
 pinta
@@ -126,7 +138,6 @@ pipewire-jack
 pipewire-pulse
 plocate
 postgresql-libs
-power-profiles-daemon
 python-gobject
 python-poetry-core
 qemu-user-static-binfmt
@@ -138,13 +149,13 @@ ruby
 rustup
 samba
 sddm
+signed
 slurp
 socat
 starship
 sudo
 sushi
 system-config-printer
-tensaku
 tesseract
 tesseract-data-eng
 tldr
@@ -161,6 +172,7 @@ ufw-docker
 usage
 uwsm
 veracrypt
+vi
 virtualbox
 virtualbox-guest-iso
 virtualbox-host-dkms
@@ -176,6 +188,7 @@ xdg-desktop-portal-hyprland
 xdg-terminal-exec
 xdotool
 xorg-server-xvfb
+xorg-xsetroot
 xournalpp
 yaru-icon-theme
 yay
