@@ -70,7 +70,29 @@
       ],
       "centerEnd": [
         {
-          "id": "omarchy.elsewhen"
+          "id": "omarchy.elsewhen",
+          "cities": [
+            {
+              "name": "Central",
+              "zone": "US/Central"
+            },
+            {
+              "name": "Sao Paulo",
+              "zone": "America/Sao_Paulo"
+            },
+            {
+              "name": "London",
+              "zone": "Europe/London"
+            },
+            {
+              "name": "Dubai",
+              "zone": "Asia/Dubai"
+            },
+            {
+              "name": "Tokyo",
+              "zone": "Asia/Tokyo"
+            }
+          ]
         },
         {
           "id": "omarchy.weather"
@@ -78,7 +100,8 @@
         {
           "id": "omarchy.system-update"
         }
-      ]
+      ],
+      "tray": []
     },
     "position": "top",
     "transparent": false
