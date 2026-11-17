@@ -51,6 +51,10 @@ if type(o) == "table" and type(o.workspaces) == "table" and type(o.workspaces.re
   o.workspaces.enabled = false
   o.workspaces.reconcile = function() end
 
+  -- The plan's persistent workspaces. Hyprland keeps one on the monitor its
+  -- rule names and moves it back after a move (#123).
+  local persistent = { ["1"] = true, ["4"] = true, ["7"] = true }
+
   local function action(expression, fn)
     o.bind_expressions[fn] = expression
     return fn
@@ -70,7 +74,20 @@ if type(o) == "table" and type(o.workspaces) == "table" and type(o.workspaces.re
 
   function o.workspaces.move_to_monitor(direction)
     return action("o.workspaces.move_to_monitor(" .. string.format("%q", direction) .. ")", function()
-      hl.dispatch(hl.dsp.workspace.move({ monitor = direction }))
+      -- workspace.move takes a monitor, not a direction. Resolve it first;
+      -- with no monitor that way, Hyprland would report an error on screen.
+      local target = hl.get_monitor(direction)
+      if not target then
+        return
+      end
+      -- Pin a persistent planned workspace to its new monitor first, so it
+      -- stays there. The rule lives until the next reload, which restores
+      -- the plan; the saved profile is unchanged.
+      local workspace = hl.get_active_workspace()
+      if workspace and persistent[tostring(workspace.id)] then
+        hl.workspace_rule({ workspace = tostring(workspace.id), monitor = target.name, persistent = true, default = false })
+      end
+      hl.dispatch(hl.dsp.workspace.move({ monitor = target.name }))
     end)
   end
 
@@ -104,7 +121,10 @@ hl.workspace_rule({ workspace = "8", monitor = "desc:LG Electronics LG ULTRAFINE
 hl.workspace_rule({ workspace = "9", monitor = "desc:LG Electronics LG ULTRAFINE 508RMGCCD663" })
 
 -- Omarchy leaves GDK_SCALE to this file.
-if type(o) == "table" then hl.env("GDK_SCALE", "1") end
+if type(o) == "table" then
+  hl.env("GDK_SCALE", "1")
+  hl.exec_cmd("dbus-update-activation-environment --systemd GDK_SCALE=1")
+end
 
 -- Omarchy's Mirror Display toggle takes effect over the profile while it is on.
 do
