@@ -12,7 +12,7 @@ hl.workspace_rule({ workspace = "10", monitor = acer, default = true, persistent
 o.window("hookecho", { workspace = "10 silent", monitor = acer, fullscreen = true })
 o.window("stormdesk", { workspace = "4 silent", monitor = lg, fullscreen = true })
 o.window("firefox", { workspace = "1 silent", monitor = sceptre, fullscreen = true })
-o.window("chatgpt", { workspace = "7 silent", monitor = chatgpt_lg })
+o.window("chatgpt", { workspace = "7 silent", monitor = chatgpt_lg, fullscreen = true })
 
 o.exec_on_start("/home/dwm/.local/bin/acer-weather-workspace")
 o.exec_on_start("/home/dwm/.local/bin/firefox-sceptre-start")
