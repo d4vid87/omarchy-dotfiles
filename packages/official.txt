@@ -153,6 +153,7 @@ signed
 slurp
 socat
 starship
+steam
 sudo
 sushi
 system-config-printer
