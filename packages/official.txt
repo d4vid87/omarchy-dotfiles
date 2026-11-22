@@ -45,6 +45,7 @@ fcitx5-qt
 fd
 ffmpegthumbnailer
 firefox
+flatpak
 foot
 fwupd
 fzf
